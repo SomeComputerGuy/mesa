@@ -507,39 +507,60 @@ poly_decomposed_prims_for_vertices_with_tess(enum mesa_prim prim, int vertices,
  * Returns (work_group_scan_inclusive_add(x), work_group_sum(x)). Implemented
  * manually with subgroup ops and local memory since Mesa doesn't do those
  * lowerings yet.
+ *
+ * Works for any subgroup size and any workgroup size. scratch must hold one
+ * uint per subgroup in the workgroup. When the workgroup has no more subgroups
+ * than the current subgroup has invocations (e.g. 1024 threads with 32-wide
+ * subgroups), the subgroup sums are scanned with a second subgroup scan.
+ * Otherwise (e.g. 256 threads with 8-wide subgroups, or a partial last
+ * subgroup) each invocation sums the preceding subgroup totals serially. The
+ * choice is uniform within a subgroup and there are no barriers past it.
  */
 static inline uint2
 poly_work_group_scan_inclusive_add(uint x, local uint *scratch)
 {
    uint sg_id = get_sub_group_id();
+   uint sg_size = get_sub_group_size();
+   uint num_sg = get_num_sub_groups();
 
    /* Partial prefix sum of the subgroup */
    uint sg = sub_group_scan_inclusive_add(x);
 
-   /* Reduction (sum) for the subgroup */
-   uint sg_sum = sub_group_broadcast(sg, 31);
+   /* Reduction (sum) for the subgroup, held by its last invocation */
+   uint sg_sum = sub_group_broadcast(sg, sg_size - 1);
 
    /* Write out all the subgroups sums */
    barrier(CLK_LOCAL_MEM_FENCE);
    scratch[sg_id] = sg_sum;
    barrier(CLK_LOCAL_MEM_FENCE);
 
-   /* Read all the subgroup sums. Thread T in subgroup G reads the sum of all
-    * threads in subgroup T.
-    */
-   uint other_sum = scratch[get_sub_group_local_id()];
+   uint base, reduction;
+   if (num_sg <= sg_size) {
+      /* Read all the subgroup sums. Thread T in subgroup G reads the sum of
+       * all threads in subgroup T.
+       */
+      uint lid = get_sub_group_local_id();
+      uint other_sum = lid < num_sg ? scratch[lid] : 0;
 
-   /* Exclusive sum the subgroup sums to get the total before the current group,
-    * which can be added to the total for the current group.
-    */
-   uint other_sums = sub_group_scan_exclusive_add(other_sum);
-   uint base = sub_group_broadcast(other_sums, sg_id);
-   uint prefix = base + sg;
+      /* Exclusive sum the subgroup sums to get the total before the current
+       * group, which can be added to the total for the current group.
+       */
+      uint other_sums = sub_group_scan_exclusive_add(other_sum);
+      base = sub_group_broadcast(other_sums, sg_id);
 
-   /* Reduce the workgroup using the prefix sum we already did */
-   uint reduction = sub_group_broadcast(other_sums + other_sum, 31);
+      /* Reduce the workgroup using the prefix sum we already did */
+      reduction = sub_group_broadcast(other_sums + other_sum, sg_size - 1);
+   } else {
+      base = 0;
+      reduction = 0;
+      for (uint i = 0; i < num_sg; ++i) {
+         uint s = scratch[i];
+         base += (i < sg_id) ? s : 0;
+         reduction += s;
+      }
+   }
 
-   return (uint2)(prefix, reduction);
+   return (uint2)(base + sg, reduction);
 }
 
 static inline void
