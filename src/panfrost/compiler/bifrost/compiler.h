@@ -8,6 +8,7 @@
 
 #include "compiler/nir/nir.h"
 #include "panfrost/compiler/pan_compiler.h"
+#include "panfrost/model/pan_model.h"
 #include "util/half_float.h"
 #include "util/shader_stats.h"
 #include "util/u_math.h"
@@ -19,6 +20,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Subgroup (warp) size of the GPU being compiled for (4 on v7.0 Mali-G31/G51) */
+static inline unsigned
+bi_subgroup_size(const struct pan_compile_inputs *inputs)
+{
+   return pan_subgroup_size_prod_id(inputs->arch, inputs->model ?
+                                    inputs->model->gpu_prod_id : 0);
+}
 
 /* Swizzles across bytes in a 32-bit word. Expresses swz in the XML directly.
  * To express widen, use the correpsonding replicated form, i.e. H01 = identity

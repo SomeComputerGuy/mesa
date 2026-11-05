@@ -749,7 +749,7 @@ panfrost_get_compute_state_info(struct pipe_context *pipe, void *cso,
    info->max_threads = pan_compute_max_thread_count(&dev->kmod.dev->props,
                                                     cs->info.work_reg_count);
    info->private_memory = cs->info.tls_size;
-   info->simd_sizes = pan_subgroup_size(dev->arch);
+   info->simd_sizes = pan_subgroup_size_gpu(panfrost_device_gpu_id(dev));
    info->preferred_simd_size = info->simd_sizes;
 }
 

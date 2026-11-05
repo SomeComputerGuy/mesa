@@ -308,7 +308,7 @@ bi_optimize_loop(nir_shader *nir, unsigned arch, bool allow_copies)
 }
 
 static void
-bi_optimize_late(nir_shader *nir, unsigned arch,
+bi_optimize_late(nir_shader *nir, unsigned arch, unsigned subgroup_size,
                 const struct pan_shader_info *info)
 {
    NIR_PASS(_, nir, nir_opt_shrink_stores, false /* shrink_image_store */);
@@ -401,7 +401,7 @@ bi_optimize_late(nir_shader *nir, unsigned arch,
 
    if (any_indirects) {
       nir_divergence_analysis(nir);
-      NIR_PASS(_, nir, bi_lower_divergent_indirects, pan_subgroup_size(arch));
+      NIR_PASS(_, nir, bi_lower_divergent_indirects, subgroup_size);
    }
 }
 
@@ -443,7 +443,7 @@ bifrost_preprocess_nir(nir_shader *nir, unsigned arch)
 static bool
 bi_lower_subgroups(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   unsigned int arch = *(unsigned *)data;
+   unsigned subgroup_size = *(unsigned *)data;
 
    b->cursor = nir_before_instr(&intr->instr);
 
@@ -475,16 +475,15 @@ bi_lower_subgroups(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        * nir_udiv_imm with a power of two divisor, which pan_subgroup_size is,
        * will construct a right shift instead of an udiv.
        */
-      val = nir_udiv_imm(b, flat_local_id, pan_subgroup_size(arch));
+      val = nir_udiv_imm(b, flat_local_id, subgroup_size);
       break;
    }
 
    case nir_intrinsic_load_subgroup_size:
-      val = nir_imm_int(b, pan_subgroup_size(arch));
+      val = nir_imm_int(b, subgroup_size);
       break;
 
    case nir_intrinsic_load_num_subgroups: {
-      uint32_t subgroup_size = pan_subgroup_size(arch);
       assert(!b->shader->info.workgroup_size_variable);
       uint32_t workgroup_size =
          b->shader->info.workgroup_size[0] *
@@ -811,6 +810,7 @@ bifrost_postprocess_nir(nir_shader *nir,
    MESA_TRACE_FUNC();
 
    const unsigned gpu_arch = inputs->arch;
+   const unsigned subgroup_size = bi_subgroup_size(inputs);
 
    if (gpu_arch >= 9)
       NIR_PASS(_, nir, pan_nir_lower_image_64bit);
@@ -1009,7 +1009,7 @@ bifrost_postprocess_nir(nir_shader *nir,
     * to scalar first.
     */
    const nir_lower_subgroups_options lower_subgroup_opts = {
-      .subgroup_size = pan_subgroup_size(gpu_arch),
+      .subgroup_size = subgroup_size,
       .ballot_bit_size = 32,
       .ballot_components = 1,
       .lower_to_scalar = true,
@@ -1040,7 +1040,7 @@ bifrost_postprocess_nir(nir_shader *nir,
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, bi_lower_subgroups,
-            nir_metadata_control_flow, (void *) &gpu_arch);
+            nir_metadata_control_flow, (void *) &subgroup_size);
 
    /* Lower constant idiv before we lower 64-bit integers */
    NIR_PASS(_, nir, nir_opt_idiv_const, 8);
@@ -1481,7 +1481,7 @@ bifrost_compile_shader_nir(nir_shader *nir,
       bifrost_handle_unified_idvs_shader(nir);
    }
 
-   bi_optimize_late(nir, arch, info);
+   bi_optimize_late(nir, arch, bi_subgroup_size(inputs), info);
 
    /* Lower constants to scalar but then immediately fold so we get minimum-
     * width vectors instead of scalars

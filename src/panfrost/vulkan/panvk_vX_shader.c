@@ -2100,9 +2100,13 @@ panvk_shader_serialize(struct vk_device *vk_dev,
 
 static VkResult
 panvk_shader_get_executable_properties(
-   UNUSED struct vk_device *device, const struct vk_shader *vk_shader,
+   struct vk_device *device, const struct vk_shader *vk_shader,
    uint32_t *executable_count, VkPipelineExecutablePropertiesKHR *properties)
 {
+   const struct panvk_physical_device *pdev =
+      to_panvk_physical_device(device->physical);
+   const unsigned subgroup_size =
+      pan_subgroup_size_gpu(pdev->kmod.dev->props.gpu_id);
    struct panvk_shader *shader =
       container_of(vk_shader, struct panvk_shader, vk);
 
@@ -2120,7 +2124,7 @@ panvk_shader_get_executable_properties(
       vk_outarray_append_typed(VkPipelineExecutablePropertiesKHR, &out, props)
       {
          props->stages = mesa_to_vk_shader_stage(shader->vk.stage);
-         props->subgroupSize = pan_subgroup_size(PAN_ARCH);
+         props->subgroupSize = subgroup_size;
 
          if (variant_name != NULL) {
             VK_PRINT_STR(props->name, "%s %s", variant_name, stage_name);
@@ -2138,7 +2142,7 @@ panvk_shader_get_executable_properties(
                                   props)
          {
             props->stages = mesa_to_vk_shader_stage(shader->vk.stage);
-            props->subgroupSize = pan_subgroup_size(PAN_ARCH);
+            props->subgroupSize = subgroup_size;
 
             if (variant_name != NULL) {
                VK_PRINT_STR(props->name, "%s %s varying", variant_name,

@@ -1986,7 +1986,7 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_ballot_relaxed: {
       assert(instr->src[0].ssa->bit_size == 32);
       enum bi_subgroup subgroup =
-         bi_subgroup_from_cluster_size(pan_subgroup_size(b->shader->arch));
+         bi_subgroup_from_cluster_size(bi_subgroup_size(b->shader->inputs));
       bi_wmask_to(b, dst, bi_src_index(&instr->src[0]), subgroup, 0);
       break;
    }
@@ -1996,7 +1996,7 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       enum bi_inactive_result inactive_result = BI_INACTIVE_RESULT_ZERO;
       enum bi_lane_op lane_op = BI_LANE_OP_NONE;
       enum bi_subgroup subgroup =
-         bi_subgroup_from_cluster_size(pan_subgroup_size(b->shader->arch));
+         bi_subgroup_from_cluster_size(bi_subgroup_size(b->shader->inputs));
       bi_clper_i32_to(b, dst,
                       bi_src_index(&instr->src[0]),
                       bi_byte(bi_src_index(&instr->src[1]), 0),
