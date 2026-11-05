@@ -393,6 +393,23 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
          }
       }
 
+      /* SEG_ADD.i64 is lowered at scheduling time to *SEG_ADD, which writes
+       * the low half of the destination, and +SEG_ADD in the same tuple,
+       * which reads src[1] and writes the high half. A read by the ADD of a
+       * register written by the FMA of its tuple is rewritten to the stage
+       * passthrough, so if src[1] shared a register with the low half of the
+       * destination, the ADD would see the new low half instead of src[1].
+       * This happens when src[0] is a uniform and the #0 high half had to be
+       * moved to a register, e.g. OpenCL __local kernel arguments, and broke
+       * every __local atomic except xchg. Keep them apart.
+       */
+      if (ins->op == BI_OPCODE_SEG_ADD_I64 && bi_is_ssa(ins->src[1]) &&
+          bi_is_ssa(ins->dest[0])) {
+         lcra_add_node_interference(l, ins->dest[0].value, bi_writemask(ins, 0),
+                                    ins->src[1].value,
+                                    BITFIELD_BIT(ins->src[1].offset));
+      }
+
       /* Valhall needs >= 64-bit reads to be pair-aligned */
       if (aligned_sr) {
          bi_foreach_ssa_src(ins, s) {
