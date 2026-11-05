@@ -73,11 +73,15 @@ panfrost_ioctl_get_param(int fd, unsigned long request, void *arg)
    case DRM_PANFROST_PARAM_CORE_FEATURES:
    case DRM_PANFROST_PARAM_COHERENCY_FEATURES:
    case DRM_PANFROST_PARAM_SELECTED_COHERENCY:
-   case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
    case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP:
    case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY:
-   case DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES:
       gp->value = 0;
+      return 0;
+   case DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES:
+      /* What a kernel without JM context priorities implies (pan_kmod
+       * assumes medium when the param is missing); panvk refuses to create
+       * a device (VK_ERROR_NOT_PERMITTED) when the medium bit is clear. */
+      gp->value = BITFIELD_BIT(PANFROST_JM_CTX_PRIORITY_MEDIUM);
       return 0;
    case DRM_PANFROST_PARAM_NR_CORE_GROUPS:
       gp->value = 1;
@@ -109,6 +113,7 @@ panfrost_ioctl_get_param(int fd, unsigned long request, void *arg)
       return 0;
    case DRM_PANFROST_PARAM_MAX_THREADS:
    case DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ:
+   case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
       gp->value = 256;
       return 0;
    default:
