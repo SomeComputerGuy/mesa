@@ -392,7 +392,7 @@ bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
    if (any_indirects) {
       nir_divergence_analysis(nir);
       NIR_PASS(_, nir, bi_lower_divergent_indirects,
-               pan_subgroup_size(pan_arch(gpu_id)));
+               pan_subgroup_size_gpu(gpu_id));
    }
 }
 
@@ -506,7 +506,6 @@ static bool
 bi_lower_subgroups(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    uint64_t gpu_id = *(uint64_t *)data;
-   unsigned int arch = pan_arch(gpu_id);
 
    b->cursor = nir_before_instr(&intr->instr);
 
@@ -538,16 +537,16 @@ bi_lower_subgroups(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        * nir_udiv_imm with a power of two divisor, which pan_subgroup_size is,
        * will construct a right shift instead of an udiv.
        */
-      val = nir_udiv_imm(b, flat_local_id, pan_subgroup_size(arch));
+      val = nir_udiv_imm(b, flat_local_id, pan_subgroup_size_gpu(gpu_id));
       break;
    }
 
    case nir_intrinsic_load_subgroup_size:
-      val = nir_imm_int(b, pan_subgroup_size(arch));
+      val = nir_imm_int(b, pan_subgroup_size_gpu(gpu_id));
       break;
 
    case nir_intrinsic_load_num_subgroups: {
-      uint32_t subgroup_size = pan_subgroup_size(arch);
+      uint32_t subgroup_size = pan_subgroup_size_gpu(gpu_id);
       assert(!b->shader->info.workgroup_size_variable);
       uint32_t workgroup_size =
          b->shader->info.workgroup_size[0] *
@@ -1035,7 +1034,7 @@ bifrost_postprocess_nir(nir_shader *nir,
     * to scalar first.
     */
    const nir_lower_subgroups_options lower_subgroup_opts = {
-      .subgroup_size = pan_subgroup_size(gpu_arch),
+      .subgroup_size = pan_subgroup_size_gpu(gpu_id),
       .ballot_bit_size = 32,
       .ballot_components = 1,
       .lower_to_scalar = true,

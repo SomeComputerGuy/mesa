@@ -1009,7 +1009,7 @@ panvk_per_arch(get_physical_device_properties)(
       .sparseResidencyStandard3DBlockShape = false,
 
       /* Vulkan 1.1 properties */
-      .subgroupSize = pan_subgroup_size(PAN_ARCH),
+      .subgroupSize = pan_subgroup_size_gpu(device->kmod.dev->props.gpu_id),
       /* We only support VS, FS, and CS.
        *
        * The HW may spawn VS invocations for non-existing indices, which could
@@ -1123,11 +1123,11 @@ panvk_per_arch(get_physical_device_properties)(
       .framebufferIntegerColorSampleCounts = sample_counts,
 
       /* Vulkan 1.3 properties */
-      .minSubgroupSize = pan_subgroup_size(PAN_ARCH),
-      .maxSubgroupSize = pan_subgroup_size(PAN_ARCH),
+      .minSubgroupSize = pan_subgroup_size_gpu(device->kmod.dev->props.gpu_id),
+      .maxSubgroupSize = pan_subgroup_size_gpu(device->kmod.dev->props.gpu_id),
       .maxComputeWorkgroupSubgroups =
          device->kmod.dev->props.max_threads_per_wg /
-         pan_subgroup_size(PAN_ARCH),
+         pan_subgroup_size_gpu(device->kmod.dev->props.gpu_id),
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
       .maxInlineUniformBlockSize = MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks =
@@ -1287,7 +1287,7 @@ panvk_per_arch(get_physical_device_properties)(
       .shaderCoreMask = device->kmod.dev->props.shader_present,
       .shaderCoreCount = util_bitcount(device->kmod.dev->props.shader_present),
       .shaderWarpsPerCore = device->kmod.dev->props.max_threads_per_core /
-                            (pan_subgroup_size(PAN_ARCH) * 2),
+                            (pan_subgroup_size_gpu(device->kmod.dev->props.gpu_id) * 2),
 
       /* VK_ARM_scheduling_controls */
       .schedulingControlsFlags =

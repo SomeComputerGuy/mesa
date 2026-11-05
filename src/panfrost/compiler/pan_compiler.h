@@ -585,6 +585,25 @@ pan_subgroup_size(unsigned arch)
 }
 
 /*
+ * Subgroup (warp) size of a given GPU. The first Bifrost v7 cores (v7.0:
+ * Mali-G51 and Mali-G31) have 4-wide warps like v6; Mali-G76 and Mali-G52
+ * (v7.2+) have 8-wide warps. Using 8 on a G31 makes ballot/CLPER use the
+ * 8-lane subgroup encoding, which faults with INSTR_INVALID_ENC, and gives
+ * wrong subgroup ids/sizes.
+ */
+static inline unsigned
+pan_subgroup_size_gpu(uint64_t gpu_id)
+{
+   unsigned arch = (gpu_id >> 28) & 0xf;
+   unsigned arch_minor = (gpu_id >> 24) & 0xf;
+
+   if (arch == 7 && arch_minor == 0)
+      return 4;
+
+   return pan_subgroup_size(arch);
+}
+
+/*
  * Helper returning the maximum offset in bytes (exclusive) that a LD_VAR_BUF*
  * instruction can use.
  */
