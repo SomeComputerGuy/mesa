@@ -64,9 +64,23 @@ panfrost_ioctl_get_param(int fd, unsigned long request, void *arg)
       return 0;
    }
 
-   case DRM_PANFROST_PARAM_SHADER_PRESENT:
-      /* Assume an MP4 GPU */
-      gp->value = 0xF;
+   case DRM_PANFROST_PARAM_SHADER_PRESENT: {
+      /* Assume an MP4 GPU unless PAN_SHADER_PRESENT says otherwise */
+      const char *sp = os_get_option("PAN_SHADER_PRESENT");
+      gp->value = sp ? strtol(sp, NULL, 16) : 0xF;
+      return 0;
+   }
+   case DRM_PANFROST_PARAM_CORE_FEATURES:
+   case DRM_PANFROST_PARAM_COHERENCY_FEATURES:
+   case DRM_PANFROST_PARAM_SELECTED_COHERENCY:
+   case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
+   case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP:
+   case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY:
+   case DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES:
+      gp->value = 0;
+      return 0;
+   case DRM_PANFROST_PARAM_NR_CORE_GROUPS:
+      gp->value = 1;
       return 0;
    case DRM_PANFROST_PARAM_L2_FEATURES:
       gp->value = 0x7120306;
