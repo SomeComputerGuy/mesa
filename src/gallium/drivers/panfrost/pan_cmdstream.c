@@ -383,9 +383,25 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
 #endif
          }
       } else {
+#if PAN_ARCH <= 7
+         /* A fragment shader that reads this render target from the tile
+          * buffer is not opaque: keep the hardware from treating it so (see
+          * panfrost_fs_reads_rt). Fixed-function needs a fixed-function
+          * equation on a blendable format; opaque mode stays otherwise.
+          */
+         bool fbfetch_rt =
+            panfrost_fs_reads_rt(fs, i) &&
+            (util_format_is_float(format) ? info.fixed_function_float
+                                          : info.fixed_function) &&
+            pan_device(ctx->base.screen)->blendable_formats[format].internal &&
+            !(pan_device(ctx->base.screen)->debug & PAN_DBG_FBFETCH_OPAQUE);
+#else
+         bool fbfetch_rt = false;
+#endif
          pan_pack(internal_blend_packed, INTERNAL_BLEND, cfg) {
-            cfg.mode = info.opaque ? MALI_BLEND_MODE_OPAQUE
-                                   : MALI_BLEND_MODE_FIXED_FUNCTION;
+            cfg.mode = (info.opaque && !fbfetch_rt)
+                          ? MALI_BLEND_MODE_OPAQUE
+                          : MALI_BLEND_MODE_FIXED_FUNCTION;
 
             /* If we want the conversion to work properly,
              * num_comps must be set to 4
@@ -407,7 +423,7 @@ panfrost_emit_blend(struct panfrost_batch *batch, void *rts,
             }
 #endif
 #if PAN_ARCH <= 7
-            if (!info.opaque) {
+            if (!info.opaque && !fbfetch_rt) {
                cfg.fixed_function.alpha_zero_nop = info.alpha_zero_nop;
                cfg.fixed_function.alpha_one_store = info.alpha_one_store;
             }
@@ -573,7 +589,14 @@ panfrost_prepare_fs_state(struct panfrost_context *ctx, uint64_t *blend_shaders,
 
       cfg.multisample_misc.sample_mask = msaa ? ctx->sample_mask : 0xFFFF;
 
-      cfg.multisample_misc.evaluate_per_sample = msaa && (ctx->min_samples > 1);
+      /* Per-sample evaluation needs a multisampled framebuffer, whether the
+       * API (min_samples) or the shader (gl_SampleID, advanced blending)
+       * asks for it; the shader's request alone is cleared from the partial
+       * RSD in prepare_shader so that it cannot force per-sample evaluation
+       * onto a single-sampled framebuffer (v9+ and panvk do the same).
+       */
+      cfg.multisample_misc.evaluate_per_sample =
+         msaa && (ctx->min_samples > 1 || fs->info.fs.sample_shading);
 
 #if PAN_ARCH >= 6
       /* MSAA blend shaders need to pass their sample ID to
@@ -4452,6 +4475,12 @@ prepare_shader(struct panfrost_compiled_shader *state,
 
    pan_pack(out, RENDERER_STATE, cfg) {
       pan_shader_prepare_rsd(&state->info, state->bin.gpu, &cfg);
+
+      /* Decided at draw time from the framebuffer's sample count, see
+       * panfrost_prepare_fs_state. */
+      if (state->info.stage == MESA_SHADER_FRAGMENT &&
+          !(pool->dev->debug & PAN_DBG_PERSAMPLE_1X))
+         cfg.multisample_misc.evaluate_per_sample = false;
    }
 #else
    assert(upload);
