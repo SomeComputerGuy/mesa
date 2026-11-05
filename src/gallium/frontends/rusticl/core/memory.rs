@@ -778,7 +778,7 @@ fn sw_copy(
 ) {
     let pixel_size = pixel_size as usize;
     for z in 0..region[2] {
-        if src_row_pitch == dst_row_pitch && region[1] * pixel_size == src_row_pitch {
+        if src_row_pitch == dst_row_pitch && region[0] * pixel_size == src_row_pitch {
             unsafe {
                 ptr::copy(
                     src.byte_add(
@@ -1277,7 +1277,7 @@ impl Buffer {
         let mut dst_offset = self.apply_offset(dst_offset)?;
         let dst_res = dst.get_res_for_access(ctx, RWFlags::WR)?;
 
-        if src_row_pitch == dst_row_pitch && region[1] == src_row_pitch {
+        if src_row_pitch == dst_row_pitch && region[0] == src_row_pitch {
             let slice_size = (region[0] * region[1]).try_into_with_err(CL_OUT_OF_RESOURCES)?;
             for _ in 0..region[2] {
                 ctx.resource_copy_buffer(
@@ -1651,7 +1651,7 @@ impl Buffer {
         let mut dst_offset = self.apply_offset(dst_offset)?;
         let dst_res = self.get_res_for_access(ctx, RWFlags::WR)?;
 
-        if src_row_pitch == dst_row_pitch && region[1] == src_row_pitch {
+        if src_row_pitch == dst_row_pitch && region[0] == src_row_pitch {
             let slice_size = (region[0] * region[1]).try_into_with_err(CL_OUT_OF_RESOURCES)?;
             for _ in 0..region[2] {
                 ctx.buffer_subdata(dst_res, dst_offset as u32, src, slice_size);
