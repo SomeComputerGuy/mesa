@@ -2187,6 +2187,51 @@ bi_add_nop_for_atest(bi_context *ctx)
    list_add(&new_clause->link, &clause->block->clauses);
 }
 
+/*
+ * A BARRIER must not be the last clause of a shader. When the final clause of
+ * a compute shader issues the barrier, the threads end together with the
+ * barrier message and memory stores issued by the workgroup before the
+ * barrier are lost: on Mali-G31 about 70% of the global stores of a kernel
+ * ending in barrier() or wait_group_events() never reach memory (OpenCL
+ * async_work_group_copy, vstore_half to __local, ...). Give the barrier a
+ * successor by appending a NOP clause, so the barrier clause has normal flow
+ * control and the shader ends one clause later.
+ */
+static void
+bi_add_nop_after_trailing_barrier(bi_context *ctx)
+{
+   if (ctx->arch >= 9 || list_is_empty(&ctx->blocks))
+      return;
+
+   /* Find the last clause of the program */
+   bi_clause *last = NULL;
+   bi_foreach_block(ctx, block) {
+      if (!list_is_empty(&block->clauses))
+         last = list_last_entry(&block->clauses, bi_clause, link);
+   }
+
+   if (!last || !last->message || last->message->op != BI_OPCODE_BARRIER)
+      return;
+
+   bi_instr *I = rzalloc(ctx, bi_instr);
+   bi_set_opcode(I, BI_OPCODE_NOP);
+
+   bi_clause *new_clause = ralloc(ctx, bi_clause);
+   *new_clause = (bi_clause){
+      .flow_control = BIFROST_FLOW_NBTB,
+      .next_clause_prefetch = true,
+      .block = last->block,
+
+      .tuple_count = 1,
+      .tuples[0] =
+         {
+            .fma = I,
+         },
+   };
+
+   list_addtail(&new_clause->link, &last->block->clauses);
+}
+
 void
 bi_schedule(bi_context *ctx)
 {
@@ -2199,4 +2244,5 @@ bi_schedule(bi_context *ctx)
 
    bi_opt_dce_post_ra(ctx);
    bi_add_nop_for_atest(ctx);
+   bi_add_nop_after_trailing_barrier(ctx);
 }
