@@ -2075,6 +2075,18 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
 
    case nir_intrinsic_read_invocation: {
       assert(instr->src[0].ssa->bit_size <= 32);
+
+      /* G71/G72/G31 only decode the old CLPER form (BIFROST_LIMITED_CLPER):
+       * fixed subgroup4, inactive_result = zero, lane_op = none, which is
+       * exactly what a 4-wide read_invocation needs. The full CLPER.i32
+       * encoding faults them with INSTR_INVALID_ENC. */
+      if (b->shader->quirks & BIFROST_LIMITED_CLPER) {
+         assert(pan_subgroup_size_gpu(b->shader->inputs->gpu_id) == 4);
+         bi_clper_old_i32_to(b, dst, bi_src_index(&instr->src[0]),
+                             bi_src_index(&instr->src[1]));
+         break;
+      }
+
       enum bi_inactive_result inactive_result = BI_INACTIVE_RESULT_ZERO;
       enum bi_lane_op lane_op = BI_LANE_OP_NONE;
       enum bi_subgroup subgroup =
