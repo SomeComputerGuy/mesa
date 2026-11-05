@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -283,6 +284,20 @@ drm_shim_ioctl_stub(int fd, unsigned long request, void *arg)
    return 0;
 }
 
+/* Hand out an always-signalled sync file: drivers (panfrost) snapshot their
+ * fences with HANDLE_TO_FD + FD_TO_HANDLE and fail the fence creation when the
+ * stub leaves fd at -1.
+ */
+static int
+drm_shim_ioctl_syncobj_handle_to_fd(int fd, unsigned long request, void *arg)
+{
+   struct drm_syncobj_handle *args = arg;
+
+   args->fd = eventfd(1, EFD_CLOEXEC);
+
+   return args->fd < 0 ? -errno : 0;
+}
+
 ioctl_fn_t core_ioctls[] = {
    [_IOC_NR(DRM_IOCTL_VERSION)] = drm_shim_ioctl_version,
    [_IOC_NR(DRM_IOCTL_GET_UNIQUE)] = drm_shim_ioctl_get_unique,
@@ -290,7 +305,7 @@ ioctl_fn_t core_ioctls[] = {
    [_IOC_NR(DRM_IOCTL_GEM_CLOSE)] = drm_shim_ioctl_gem_close,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_CREATE)] = drm_shim_ioctl_syncobj_create,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_DESTROY)] = drm_shim_ioctl_stub,
-   [_IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD)] = drm_shim_ioctl_stub,
+   [_IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD)] = drm_shim_ioctl_syncobj_handle_to_fd,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE)] = drm_shim_ioctl_stub,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_WAIT)] = drm_shim_ioctl_stub,
    [_IOC_NR(DRM_IOCTL_SYNCOBJ_TRANSFER)] = drm_shim_ioctl_stub,
