@@ -449,7 +449,10 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
          panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 64 * 1024,
       .label = "Command buffer descriptor pool",
-      .prealloc = true,
+      /* Allocated on first use, like the other pools: a 64 KiB BO per
+       * command buffer up front costs 640 MiB of GPU memory for the 10000
+       * command buffers of dEQP-VK.api.command_buffers.allocate_many_*. */
+      .prealloc = false,
       .owns_bos = true,
       .needs_locking = false,
    };
