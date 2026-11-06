@@ -2171,17 +2171,16 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
    }
 
    case nir_intrinsic_load_core_id:
-      assert(b->shader->arch >= 9);
       bi_mov_i32_to(b, dst, bi_fau(BIR_FAU_CORE_ID, false));
       break;
 
    case nir_intrinsic_load_core_count_arm:
+      /* Inlined by the driver before Valhall. */
       assert(b->shader->arch >= 9);
       bi_mov_i32_to(b, dst, bi_iadd_u32(b, bi_fau(BIR_FAU_CORE_ID, true), bi_imm_u32(1), false));
       break;
 
    case nir_intrinsic_load_warp_id_arm:
-      assert(b->shader->arch >= 9);
       bi_mov_i32_to(b, dst, bi_fau(BIR_FAU_WARP_ID, false));
       break;
 
