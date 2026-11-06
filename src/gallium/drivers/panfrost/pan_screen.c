@@ -197,6 +197,16 @@ panfrost_is_format_supported(struct pipe_screen *screen,
 
    unsigned pan_bind_flags = pipe_to_pan_bind_flags(bind);
    struct pan_format fmt = dev->formats[format];
+
+   /* Texel buffers (sampler views and images on a PIPE_BUFFER) are read
+    * through the attribute unit on Bifrost and through buffer descriptors on
+    * Valhall: only the formats marked as texel-buffer capable work there
+    * (panvk already checks this flag). A8_UNORM, for one, is a texture-only
+    * format on v7: an attribute in that format faults the G31 with
+    * INSTR_INVALID_ENC. */
+   if (target == PIPE_BUFFER &&
+       (bind & (PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE)))
+      pan_bind_flags |= PAN_BIND_TEXEL_BUFFER;
    unsigned fmt_bind_flags = fmt.bind;
 
    /* Also check that compressed texture formats are supported on this
