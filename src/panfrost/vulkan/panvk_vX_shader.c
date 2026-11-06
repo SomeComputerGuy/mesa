@@ -500,6 +500,18 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
    NIR_PASS(_, nir, nir_inline_sysval, nir_intrinsic_load_core_max_id_arm,
             core_max_id);
 
+#if PAN_ARCH < 9
+   /* Bifrost has the core_id and warp_id FAU slots, but what their high
+    * words hold is not known, so the core count and the maximum warp id are
+    * inlined from the properties reported for VK_ARM_shader_core_builtins.
+    */
+   NIR_PASS(_, nir, nir_inline_sysval, nir_intrinsic_load_core_count_arm,
+            util_bitcount64(pdev->kmod.dev->props.shader_present));
+   NIR_PASS(_, nir, nir_inline_sysval, nir_intrinsic_load_warp_max_id_arm,
+            pdev->kmod.dev->props.max_threads_per_core /
+               (pan_subgroup_size_gpu(pdev->kmod.dev->props.gpu_id) * 2) - 1);
+#endif
+
    pan_preprocess_nir(nir, pdev->kmod.dev->props.gpu_id);
 }
 
