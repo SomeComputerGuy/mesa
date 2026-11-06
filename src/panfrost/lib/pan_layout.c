@@ -63,6 +63,19 @@ get_mip_level_extent(const struct pan_image_props *props, unsigned plane_idx,
    };
 }
 
+static bool
+pan_image_needs_overfetch_pad(enum pipe_format format, unsigned plane_idx)
+{
+   if (util_format_is_compressed(format))
+      return false;
+
+   enum pipe_format plane_format =
+      util_format_get_plane_format(format, plane_idx);
+
+   return !util_is_power_of_two_nonzero(
+      util_format_get_blocksize(plane_format));
+}
+
 bool
 pan_image_layout_init(
    unsigned arch, struct pan_image *image, unsigned plane_idx,
@@ -178,8 +191,19 @@ pan_image_layout_init(
       assert(!explicit_layout_constraints ||
              explicit_layout_constraints->offset_B ==
                 layout->slices[0].offset_B);
-      layout->data_size_B = ALIGN_POT(
-         (uint64_t)layout->array_stride_B * (uint64_t)props->array_size, 4096);
+      uint64_t size_B =
+         (uint64_t)layout->array_stride_B * (uint64_t)props->array_size;
+
+      /* Images of a non-power-of-two texel size (RGB8, RGB32) seem to be
+       * read past their last texel: on Mali-G31 such an image whose data
+       * ends on a page boundary takes a JOB_BUS_FAULT on the page-aligned VA
+       * right after the BO when nothing is mapped there. Leave one cache
+       * line of slack after these images.
+       */
+      if (pan_image_needs_overfetch_pad(props->format, plane_idx))
+         size_B += 64;
+
+      layout->data_size_B = ALIGN_POT(size_B, 4096);
    }
 
    return true;
