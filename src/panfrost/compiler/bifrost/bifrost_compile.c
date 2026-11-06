@@ -1985,6 +1985,32 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_ballot:
    case nir_intrinsic_ballot_relaxed: {
       assert(instr->src[0].ssa->bit_size == 32);
+
+      /* G71/G72/G31 (BIFROST_LIMITED_CLPER) have no WMASK: it faults them
+       * with INSTR_INVALID_ENC, like the full CLPER encoding. Their subgroup
+       * is 4 lanes, so gather the predicate of each lane with CLPER_OLD
+       * (which returns zero for an inactive source lane) and assemble the
+       * mask. 32-bit booleans are 0/~0, so AND with the lane bit. */
+      if (b->shader->quirks & BIFROST_LIMITED_CLPER) {
+         assert(bi_subgroup_size(b->shader->inputs) == 4);
+         bi_index pred = bi_src_index(&instr->src[0]);
+         bi_index mask = bi_null();
+
+         for (unsigned lane = 0; lane < 4; ++lane) {
+            bi_index v = bi_clper_old_i32(b, pred, bi_imm_u32(lane));
+            bi_index bit = bi_lshift_and_i32(b, v, bi_imm_u32(1 << lane),
+                                             bi_imm_u8(0));
+
+            if (lane == 3)
+               bi_lshift_or_i32_to(b, dst, mask, bit, bi_imm_u8(0));
+            else if (lane == 0)
+               mask = bit;
+            else
+               mask = bi_lshift_or_i32(b, mask, bit, bi_imm_u8(0));
+         }
+         break;
+      }
+
       enum bi_subgroup subgroup =
          bi_subgroup_from_cluster_size(bi_subgroup_size(b->shader->inputs));
       bi_wmask_to(b, dst, bi_src_index(&instr->src[0]), subgroup, 0);
