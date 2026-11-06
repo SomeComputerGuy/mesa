@@ -34,6 +34,7 @@
 #include "panvk_physical_device.h"
 #include "panvk_wsi.h"
 
+#include "compiler/pan_compiler.h"
 #include "pan_afbc.h"
 #include "pan_compiler.h"
 #include "pan_props.h"
@@ -1081,6 +1082,24 @@ panvk_get_max_buffer_size(const struct panvk_physical_device *device)
    const unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
    unsigned max_desc_size = u_uintN_max(arch < 11 ? 32 : 48);
    return MIN2(max_desc_size, device->memory.max_supported_va);
+}
+
+uint32_t
+panvk_get_shader_warps_per_core(const struct panvk_physical_device *device)
+{
+   const uint64_t gpu_id = device->kmod.dev->props.gpu_id;
+   const unsigned warp_size = pan_subgroup_size_gpu(gpu_id);
+
+   /* Bifrost: max_threads_per_core thread slots in warps of warp_size, so
+    * up to max_threads_per_core / warp_size warps per core (128 on the G31:
+    * 512 threads, 4-wide warps). With half of that, about half of the warps
+    * read a WARP_ID above the advertised maximum. Valhall keeps the upstream
+    * value.
+    */
+   if (pan_arch(gpu_id) < 9)
+      return device->kmod.dev->props.max_threads_per_core / warp_size;
+
+   return device->kmod.dev->props.max_threads_per_core / (warp_size * 2);
 }
 
 static VkFormatFeatureFlags2
