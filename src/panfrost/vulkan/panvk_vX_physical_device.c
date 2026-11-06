@@ -1285,8 +1285,7 @@ panvk_per_arch(get_physical_device_properties)(
       /* VK_ARM_shader_core_builtins */
       .shaderCoreMask = device->kmod.dev->props.shader_present,
       .shaderCoreCount = util_bitcount(device->kmod.dev->props.shader_present),
-      .shaderWarpsPerCore = device->kmod.dev->props.max_threads_per_core /
-                            (pan_subgroup_size_gpu(device->kmod.dev->props.gpu_id) * 2),
+      .shaderWarpsPerCore = panvk_get_shader_warps_per_core(device),
 
       /* VK_ARM_scheduling_controls */
       .schedulingControlsFlags =
