@@ -63,10 +63,6 @@ static const struct debug_named_value panfrost_debug_options[] = {
    {"yuv",        PAN_DBG_YUV,        "Tint YUV textures with blue for 1-plane and green for 2-plane"},
    {"forcepack",  PAN_DBG_FORCE_PACK, "Pack AFBC textures progressively in the background"},
    {"cs",         PAN_DBG_CS,         "Enable extra checks in command stream"},
-   /* Debug-only A/B switches restoring the pre-fix descriptors for fragment shaders that read the tile buffer */
-   {"fbfetch_opaque",   PAN_DBG_FBFETCH_OPAQUE,   "Keep the opaque blend mode and alpha hints for tilebuffer-reading fragment shaders"},
-   {"fbfetch_overdraw", PAN_DBG_FBFETCH_OVERDRAW, "Keep the overdraw alpha hints for tilebuffer-reading fragment shaders"},
-   {"persample_1x",     PAN_DBG_PERSAMPLE_1X,     "Let a sample-shading fragment shader force per-sample evaluation on single-sampled framebuffers"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */

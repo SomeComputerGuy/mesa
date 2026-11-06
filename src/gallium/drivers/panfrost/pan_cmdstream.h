@@ -88,30 +88,6 @@ panfrost_is_implicit_prim_restart(const struct pipe_draw_info *info)
           info->restart_index == (unsigned)BITFIELD_MASK(info->index_size * 8);
 }
 
-/*
- * Does the fragment shader read colour render target rt back from the tile
- * buffer (framebuffer fetch, KHR_blend_equation_advanced lowered into the
- * shader)? Such a fragment is not opaque whatever the blend state says: its
- * output depends on every fragment before it at the same position, so the
- * hardware must not be told that the fragment fully overwrites the pixel
- * (opaque blend mode, alpha hints, overdraw hints). On Mali-G31 (v7.0) the
- * opaque descriptors let the tile-buffer updates of consecutive dependent
- * fragments get out of order: KHR-GLES31 blend_equation_advanced
- * test_coherency.mixedSequence (44 dependent draws in one fragment job).
- */
-static inline bool
-panfrost_fs_reads_rt(const struct panfrost_compiled_shader *fs, unsigned rt)
-{
-   return fs && (fs->info.fs.outputs_read &
-                 BITFIELD64_BIT(FRAG_RESULT_DATA0 + rt));
-}
-
-static inline bool
-panfrost_fs_reads_tilebuffer(const struct panfrost_compiled_shader *fs)
-{
-   return fs && fs->info.fs.outputs_read != 0;
-}
-
 static inline bool
 pan_allow_forward_pixel_to_kill(struct panfrost_context *ctx,
                                 struct panfrost_compiled_shader *fs)
@@ -142,13 +118,6 @@ static inline bool
 panfrost_overdraw_alpha(const struct panfrost_context *ctx, bool zero)
 {
    const struct panfrost_blend_state *so = ctx->blend;
-
-   /* A shader that reads the tile buffer never implies full overdraw or a
-    * no-op, whatever its alpha: the result depends on the older fragments.
-    */
-   if (panfrost_fs_reads_tilebuffer(ctx->prog[MESA_SHADER_FRAGMENT]) &&
-       !(pan_device(ctx->base.screen)->debug & PAN_DBG_FBFETCH_OVERDRAW))
-      return false;
 
    for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
       const struct pan_blend_info info = so->info[i];
