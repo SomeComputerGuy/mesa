@@ -30,6 +30,10 @@ struct panvk_image_plane {
 
    /* Plane offset inside the memory object. */
    uint64_t mem_offset;
+
+   /* Bytes the memory requirements reserve past an explicit layout, see
+    * PAN_IMAGE_OVERFETCH_PAD_B. Layouts we choose already include it. */
+   uint32_t explicit_pad_B;
 };
 
 struct panvk_image {

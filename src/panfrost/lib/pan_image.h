@@ -313,6 +313,11 @@ bool pan_image_layout_init(
    unsigned arch, struct pan_image *image, unsigned plane_idx,
    const struct pan_image_layout_constraints *explicit_layout_constraints);
 
+/* Non-power-of-two texel formats (RGB8, RGB32) are read up to a cache line
+ * past their last texel; layouts we choose leave 64 bytes of slack for that. */
+#define PAN_IMAGE_OVERFETCH_PAD_B 64
+bool pan_image_needs_overfetch_pad(enum pipe_format format, unsigned plane_idx);
+
 struct pan_image_usage {
    /* PAN_BIND_xxx flags. */
    uint32_t bind;

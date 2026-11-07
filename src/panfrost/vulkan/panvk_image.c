@@ -497,6 +497,13 @@ panvk_image_init_layouts(struct panvk_image *image,
                             VK_ERROR_INITIALIZATION_FAILED);
       }
 
+      /* Explicit layouts are exact. Reserve the same overfetch slack in the
+       * memory requirements as a layout we choose has, so an imported image
+       * needs as much memory as the exported one it describes. */
+      if (explicit_info &&
+          pan_image_needs_overfetch_pad(pan_img->props.format, pan_plane))
+         image->planes[plane].explicit_pad_B = PAN_IMAGE_OVERFETCH_PAD_B;
+
       if (!is_disjoint(image) && !explicit_info)
          plane_layout.offset_B += image->planes[plane].plane.layout.data_size_B;
    }
@@ -581,7 +588,8 @@ static uint64_t
 panvk_image_plane_size(const struct panvk_image *image, unsigned plane)
 {
    const struct pan_image_layout *layout = &image->planes[plane].plane.layout;
-   return layout->slices[0].offset_B + layout->data_size_B;
+   return layout->slices[0].offset_B + layout->data_size_B +
+          image->planes[plane].explicit_pad_B;
 }
 
 static uint64_t
@@ -1013,7 +1021,8 @@ panvk_GetImageMemoryRequirements2(VkDevice device,
       plane_info ? plane_info->planeAspect : image->vk.aspects;
    uint8_t plane = panvk_plane_index(image, aspects);
    const uint64_t size_non_sparse =
-      disjoint ? image->planes[plane].plane.layout.data_size_B :
+      disjoint ? image->planes[plane].plane.layout.data_size_B +
+                    image->planes[plane].explicit_pad_B :
       panvk_image_get_total_size(image);
    const uint64_t size =
       image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT
