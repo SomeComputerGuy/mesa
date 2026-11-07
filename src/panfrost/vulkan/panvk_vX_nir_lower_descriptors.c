@@ -819,6 +819,61 @@ lower_tex_immutable(nir_builder *b, nir_tex_instr *tex,
    }
 }
 
+#if PAN_ARCH < 9
+/* textureQueryLod().x is the mip level the sampler would access. The Bifrost
+ * GRDESC lowering returns the clamped LOD rounded to the nearest level, which
+ * is only right for VK_SAMPLER_MIPMAP_MODE_NEAREST. Derive .x from the raw
+ * LOD (.y) and the sampler descriptor instead, the way va_lower_lod does on
+ * Valhall: clamp to [min LOD, min(max LOD, levels - 1)], then 0 for mipmap
+ * mode None, ceil(lod + 0.5) - 1 for Nearest, the clamped LOD for the two
+ * trilinear modes. */
+static void
+lower_tex_query_lod_level(nir_builder *b, nir_tex_instr *tex,
+                          const struct lower_desc_ctx *ctx)
+{
+   int samp_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (samp_src_idx < 0 || tex_src_idx < 0)
+      return;
+
+   nir_deref_instr *samp_deref =
+      nir_src_as_deref(tex->src[samp_src_idx].src);
+   nir_deref_instr *tex_deref = nir_src_as_deref(tex->src[tex_src_idx].src);
+
+   b->cursor = nir_after_instr(&tex->instr);
+
+   nir_def *samp = load_resource_deref_desc(
+      b, samp_deref, VK_DESCRIPTOR_TYPE_SAMPLER, 0, 2, 32, ctx);
+   nir_def *samp_w0 = nir_channel(b, samp, 0);
+   nir_def *samp_w1 = nir_channel(b, samp, 1);
+
+   /* Minimum LOD word1[0:12], Maximum LOD word1[16:28], 8 fraction bits */
+   nir_def *min_lod = nir_fdiv_imm(
+      b, nir_u2f32(b, nir_ubitfield_extract_imm(b, samp_w1, 0, 13)), 256.0);
+   nir_def *max_lod = nir_fdiv_imm(
+      b, nir_u2f32(b, nir_ubitfield_extract_imm(b, samp_w1, 16, 13)), 256.0);
+
+   nir_def *levels = load_tex_levels(b, tex_deref, tex->sampler_dim, ctx);
+   max_lod = nir_fmin(b, max_lod, nir_u2f32(b, nir_iadd_imm(b, levels, -1)));
+
+   nir_def *lod = nir_fclamp(b, nir_channel(b, &tex->def, 1), min_lod, max_lod);
+
+   /* Mipmap Mode word0[30:31]: 0 Nearest, 1 None, 2/3 (performance) trilinear */
+   nir_def *mipmap_mode = nir_ubitfield_extract_imm(b, samp_w0, 30, 2);
+   nir_def *nearest_lod =
+      nir_fadd_imm(b, nir_fceil(b, nir_fadd_imm(b, lod, 0.5)), -1.0);
+
+   nir_def *level = nir_bcsel(b, nir_ieq_imm(b, mipmap_mode, 1),
+                              nir_imm_float(b, 0.0), lod);
+   level = nir_bcsel(b, nir_ieq_imm(b, mipmap_mode, 0), nearest_lod, level);
+
+   nir_def *res = nir_vector_insert_imm(b, &tex->def, level, 0);
+   nir_def_rewrite_uses_after(&tex->def, res);
+
+   b->cursor = nir_before_instr(&tex->instr);
+}
+#endif
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 {
@@ -840,6 +895,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
    lower_tex_immutable(b, tex, ctx);
 
 #if PAN_ARCH < 9
+   if (tex->op == nir_texop_lod)
+      lower_tex_query_lod_level(b, tex, ctx);
+
    if (tex->op == nir_texop_txs || tex->op == nir_texop_query_levels ||
        tex->op == nir_texop_texture_samples) {
       int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
