@@ -518,10 +518,13 @@ panvk_image_init_layouts(struct panvk_image *image,
 
       /* Explicit layouts are exact. Reserve the same overfetch slack in the
        * memory requirements as a layout we choose has, so an imported image
-       * needs as much memory as the exported one it describes. */
-      if (explicit_info &&
-          pan_image_needs_overfetch_pad(pan_img->props.format, pan_plane))
-         image->planes[plane].explicit_pad_B = PAN_IMAGE_OVERFETCH_PAD_B;
+       * needs as much memory as the exported one it describes. Always set
+       * it: vkGetDeviceImageMemoryRequirements() and the sparse queries
+       * initialize a panvk_image on the stack. */
+      image->planes[plane].explicit_pad_B =
+         explicit_info &&
+         pan_image_needs_overfetch_pad(pan_img->props.format, pan_plane) ?
+         PAN_IMAGE_OVERFETCH_PAD_B : 0;
 
       if (!is_disjoint(image) && !explicit_info)
          plane_layout.offset_B += image->planes[plane].plane.layout.data_size_B;
