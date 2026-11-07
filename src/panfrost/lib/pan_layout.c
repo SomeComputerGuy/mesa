@@ -63,7 +63,7 @@ get_mip_level_extent(const struct pan_image_props *props, unsigned plane_idx,
    };
 }
 
-static bool
+bool
 pan_image_needs_overfetch_pad(enum pipe_format format, unsigned plane_idx)
 {
    if (util_format_is_compressed(format))
@@ -201,7 +201,7 @@ pan_image_layout_init(
        * line of slack after these images.
        */
       if (pan_image_needs_overfetch_pad(props->format, plane_idx))
-         size_B += 64;
+         size_B += PAN_IMAGE_OVERFETCH_PAD_B;
 
       layout->data_size_B = ALIGN_POT(size_B, 4096);
    }
