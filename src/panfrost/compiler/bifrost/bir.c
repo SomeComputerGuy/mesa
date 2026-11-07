@@ -71,6 +71,15 @@ bi_count_read_registers(const bi_instr *ins, unsigned s)
       return (ins->atom_opc == BI_ATOM_OPC_ACMPXCHG) ? 2 : 1;
    else if (s == 0 && ins->op == BI_OPCODE_ATOM_RETURN_I64)
       return (ins->atom_opc == BI_ATOM_OPC_ACMPXCHG) ? 4 : 2;
+   /* +ATOM_CX is what the scheduler lowers ATOM_RETURN to (bi_lower_atom_c*),
+    * and it keeps the pseudo-op's atom_opc, so it must read the same staging
+    * registers. Otherwise the post-scheduling liveness sees the upper half
+    * of the return as read, keeps writes the scheduler assumed dead, and the
+    * last tuple of a clause can end up with two register writes (invalid
+    * encoding, INSTR_INVALID_ENC on the GPU). */
+   else if (s == 0 && ins->op == BI_OPCODE_ATOM_CX)
+      return (ins->atom_opc == BI_ATOM_OPC_ACMPXCHG) ? ins->sr_count
+                                                     : MAX2(ins->sr_count / 2, 1);
    else if (s == 0 && bi_get_opcode_props(ins)->sr_read)
       return bi_count_staging_registers(ins);
    else if (s == 4 && ins->op == BI_OPCODE_BLEND)

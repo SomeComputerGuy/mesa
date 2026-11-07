@@ -349,6 +349,8 @@ bi_lower_atom_c(bi_context *ctx, struct bi_clause_state *clause,
    bi_instr *atom_cx =
       bi_atom_cx_to(&b, pinstr->dest[0], pinstr->src[0], pinstr->src[1],
                     pinstr->src[2], pinstr->src[0], pinstr->sr_count);
+   /* Not encoded; bi_count_read_registers needs it (ACMPXCHG reads all) */
+   atom_cx->atom_opc = pinstr->atom_opc;
    tuple->add = atom_cx;
    bi_remove_instruction(pinstr);
 
@@ -391,6 +393,8 @@ bi_lower_atom_c_64(bi_context *ctx, struct bi_clause_state *clause,
    bi_instr *atom_cx =
       bi_atom_cx_to(&b, pinstr->dest[0], pinstr->src[0], pinstr->src[1],
                     pinstr->src[2], pinstr->src[0], pinstr->sr_count);
+   /* Not encoded; bi_count_read_registers needs it (ACMPXCHG reads all) */
+   atom_cx->atom_opc = pinstr->atom_opc;
    tuple->add = atom_cx;
    bi_remove_instruction(pinstr);
 
