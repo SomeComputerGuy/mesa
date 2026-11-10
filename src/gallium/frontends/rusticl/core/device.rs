@@ -894,9 +894,10 @@ impl DeviceBase {
         64 * 1024
     }
 
-    /// OpenCL 2.0 pipes (vtn_handle_pipe, rusticl_lower_pipes)
+    /// OpenCL 2.0 pipes (vtn_handle_pipe, rusticl_lower_pipes). clang only accepts
+    /// __opencl_c_pipes together with __opencl_c_generic_address_space.
     pub fn pipes_supported(&self) -> bool {
-        true
+        self.generic_address_space_supported()
     }
 
     pub fn wg_collectives_supported(&self) -> bool {
