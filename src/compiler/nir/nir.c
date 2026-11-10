@@ -3789,7 +3789,7 @@ nir_slot_num_components(gl_varying_slot slot, mesa_shader_stage stage) {
    case VARYING_SLOT_TESS_LEVEL_OUTER:
       if (stage == MESA_SHADER_MESH)
          return 1; /* VARYING_SLOT_PRIMITIVE_COUNT */
-      assert(stage == MESA_SHADER_TESS_CTRL);
+      assert(stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL);
       return 4;
    case VARYING_SLOT_TESS_LEVEL_INNER:
       if (stage == MESA_SHADER_MESH)
@@ -3797,7 +3797,7 @@ nir_slot_num_components(gl_varying_slot slot, mesa_shader_stage stage) {
           * is different between NV_mesh_shader (where it is always 1) and
           * EXT_mesh_shader (where it depends on the primitive topology). */
          return 0;
-      assert(stage == MESA_SHADER_TESS_CTRL);
+      assert(stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL);
       return 2;
    case VARYING_SLOT_BOUNDING_BOX0:
       if (stage == MESA_SHADER_TASK)
