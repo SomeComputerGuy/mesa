@@ -156,6 +156,44 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size, unsigned arch)
    return nir;
 }
 
+/*
+ * Variants are compute shaders, so derefs built after spirv_to_nir (e.g. by
+ * nir_split_struct_vars on large private structs) get 32-bit pointers while
+ * the rest of the library has 64-bit ones. Give them the 64 bits that the
+ * generic address format expects.
+ */
+static bool
+widen_deref(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_deref)
+      return false;
+
+   nir_deref_instr *deref = nir_instr_as_deref(instr);
+   if (deref->def.bit_size == 64)
+      return false;
+
+   deref->def.bit_size = 64;
+
+   if (deref->deref_type == nir_deref_type_array ||
+       deref->deref_type == nir_deref_type_ptr_as_array) {
+      nir_def *index = deref->arr.index.ssa;
+
+      if (index->bit_size != 64) {
+         b->cursor = nir_before_instr(instr);
+         nir_src_rewrite(&deref->arr.index, nir_u2u64(b, index));
+      }
+   }
+
+   return true;
+}
+
+static bool
+widen_derefs(nir_shader *nir)
+{
+   return nir_shader_instructions_pass(nir, widen_deref, nir_metadata_all,
+                                       NULL);
+}
+
 static nir_def *
 load_sysval_from_push_const(nir_builder *b, unsigned offset, unsigned bit_size,
                             unsigned num_comps)
@@ -420,6 +458,7 @@ main(int argc, const char **argv)
           * different address formats inside shaders */
          NIR_PASS(_, s, nir_opt_deref);
          NIR_PASS(_, s, nir_lower_vars_to_ssa);
+         NIR_PASS(_, s, widen_derefs);
          NIR_PASS(_, s, nir_lower_explicit_io,
                   nir_var_shader_temp | nir_var_function_temp |
                      nir_var_mem_shared | nir_var_mem_global,
@@ -438,6 +477,8 @@ main(int argc, const char **argv)
 
          NIR_PASS(_, s, nir_opt_deref);
          NIR_PASS(_, s, nir_lower_vars_to_ssa);
+
+         NIR_PASS(_, s, widen_derefs);
          NIR_PASS(_, s, nir_lower_explicit_io,
                   nir_var_shader_temp | nir_var_function_temp |
                      nir_var_mem_shared | nir_var_mem_global,
