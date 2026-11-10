@@ -939,8 +939,11 @@ jm_push_vertex_tiler_jobs(struct panfrost_batch *batch,
                           const struct pan_ptr *tiler_job)
 {
    unsigned vertex =
-      pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_VERTEX, false, false,
-                     0, 0, vertex_job, false);
+      pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_VERTEX,
+                     batch->vertex_barrier, false, 0, 0, vertex_job, false);
+
+   batch->last_vertex_job = vertex_job->gpu;
+   batch->last_tiler_job = tiler_job->gpu;
 
    pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_TILER, false, false,
                   vertex, 0, tiler_job, false);
@@ -1017,7 +1020,7 @@ GENX(jm_launch_draw)(struct panfrost_batch *batch,
          batch, pan_section_ptr(tiler.cpu, INDEXED_VERTEX_JOB, VERTEX_DRAW));
 
       pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX,
-                     false, false, 0, 0, &tiler, false);
+                     batch->vertex_barrier, false, 0, 0, &tiler, false);
 #endif
    } else {
       jm_emit_vertex_job(batch, info, &invocation, vertex.cpu);
@@ -1025,6 +1028,41 @@ GENX(jm_launch_draw)(struct panfrost_batch *batch,
    }
 #endif
 }
+
+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
+/* Compute job of a libpoly program, after every earlier job of the chain */
+void
+GENX(jm_launch_poly_compute)(struct panfrost_batch *batch,
+                             const struct panfrost_poly_compute *c)
+{
+   struct pan_ptr t = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+
+   pan_pack_work_groups_compute(pan_section_ptr(t.cpu, COMPUTE_JOB, INVOCATION),
+                                c->grid[0], c->grid[1], c->grid[2],
+                                c->block[0], c->block[1], c->block[2], false,
+                                false);
+
+   pan_section_pack(t.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = util_logbase2_ceil(c->block[0] + 1) +
+                           util_logbase2_ceil(c->block[1] + 1) +
+                           util_logbase2_ceil(c->block[2] + 1);
+   }
+
+   pan_section_pack(t.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = c->rsd;
+      cfg.attributes = c->attribs;
+      cfg.attribute_buffers = c->attrib_bufs;
+      cfg.thread_storage = batch->tls.gpu;
+      cfg.uniform_buffers = c->ubos;
+      cfg.push_uniforms = c->push;
+      cfg.textures = c->textures;
+      cfg.samplers = c->samplers;
+   }
+
+   pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_COMPUTE, true, false,
+                  0, 0, &t, false);
+}
+#endif
 
 void
 GENX(jm_launch_draw_indirect)(struct panfrost_batch *batch,

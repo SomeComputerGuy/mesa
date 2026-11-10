@@ -163,6 +163,14 @@ struct panfrost_batch {
    /* Number of compute jobs in the batch. */
    uint32_t compute_count;
 
+   /* The next draw's vertex job waits for all earlier jobs of the chain
+    * (it reads what libpoly compute jobs wrote).
+    */
+   bool vertex_barrier;
+
+   /* GPU addresses of the vertex and tiler jobs of the last non-IDVS draw */
+   uint64_t last_vertex_job, last_tiler_job;
+
    /* Set when cycle count is required for this batch. */
    bool need_job_req_cycle_count;
 

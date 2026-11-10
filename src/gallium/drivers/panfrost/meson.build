@@ -26,6 +26,7 @@ files_panfrost = files(
   'pan_nir_lower_pls.c',
   'pan_nir_lower_sysvals.c',
   'pan_nir_lower_res_indices.c',
+  'pan_nir_lower_poly.c',
 )
 
 panfrost_includes = [
@@ -70,6 +71,7 @@ panfrost_deps = [
   idep_nir,
   idep_pan_packers,
   idep_u_tracepoints,
+  idep_libpoly,
 ]
 
 panfrost_cpp_args = cpp.get_supported_arguments([
@@ -106,7 +108,7 @@ foreach ver : panfrost_versions
     gnu_symbol_visibility : 'hidden',
     dependencies : [idep_pan_packers, idep_nir, dep_libdrm, idep_mesautil,
                     idep_libpan_per_arch[ver], idep_u_tracepoints,
-                    idep_panfrost_tracepoints],
+                    idep_panfrost_tracepoints, idep_libpoly],
 )
 endforeach
 
@@ -123,5 +125,5 @@ libpanfrost = static_library(
 
 driver_panfrost = declare_dependency(
   compile_args : compile_args_panfrost,
-  link_with : [libpanfrost, libpanfrostwinsys, libpanfrost_shared, libpanfrost_compiler, libpanfrost_decode, libpanfrost_lib],
+  link_with : [libpanfrost, libpanfrostwinsys, libpanfrost_shared, libpanfrost_compiler, libpanfrost_decode, libpanfrost_lib, libpoly_nir],
 )

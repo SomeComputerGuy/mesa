@@ -16,6 +16,7 @@
 #include "util/u_helpers.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
+#include "util/u_prim_restart.h"
 #include "util/u_sample_positions.h"
 #include "util/u_vbuf.h"
 #include "util/u_viewport.h"
@@ -38,6 +39,8 @@
 #include "pan_job.h"
 #include "pan_pool.h"
 #include "pan_precomp.h"
+#include "libpan.h"
+#include "poly/tessellator.h"
 #include "pan_resource.h"
 #include "pan_samples.h"
 #include "pan_shader.h"
@@ -1422,6 +1425,27 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
          break;
       case PAN_SYSVAL_PRINTF_BUFFER:
          uniforms[i].du[0] = batch->ctx->printf.bo->ptr.gpu;
+         break;
+      case PAN_SYSVAL_POLY:
+         switch (PAN_SYSVAL_ID(sysval)) {
+         case PAN_SYSVAL_POLY_VERTEX_PARAMS:
+            uniforms[i].du[0] = batch->ctx->poly.vp;
+            break;
+         case PAN_SYSVAL_POLY_GEOMETRY_PARAMS:
+            uniforms[i].du[0] = batch->ctx->poly.gp;
+            break;
+         case PAN_SYSVAL_POLY_TESS_PARAMS:
+            uniforms[i].du[0] = batch->ctx->poly.tp;
+            break;
+         case PAN_SYSVAL_POLY_SINK:
+            uniforms[i].du[0] = batch->ctx->poly.sink;
+            break;
+         case PAN_SYSVAL_POLY_PROVOKING_LAST:
+            uniforms[i].u[0] = batch->ctx->poly.provoking_last;
+            break;
+         default:
+            UNREACHABLE("invalid poly sysval");
+         }
          break;
       default:
          assert(0);
@@ -3416,6 +3440,499 @@ panfrost_draw_get_vertex_count(struct panfrost_batch *batch,
    return vertex_count;
 }
 
+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
+/*
+ * Geometry shaders, lowered with libpoly (see pan_nir_lower_poly.c). A draw
+ * becomes:
+ *
+ *    1. the vertex shader as a compute job over the vertex range of the draw,
+ *       storing its outputs to memory (like the transform feedback program);
+ *    2. the main geometry program as a compute job, one invocation per input
+ *       primitive and instance, writing the index buffer of the output
+ *       primitives (dynamic topologies only);
+ *    3. the rasterization draw: a vertex job running the geometry shader's
+ *       rasterization program (it re-runs the geometry shader for each output
+ *       vertex) and a tiler job, after the compute jobs.
+ *
+ * The Arm driver uses the same job sequence on this GPU (compute jobs between
+ * the vertex and tiler jobs of a draw, the tiler job drawing an index buffer
+ * written by a compute job).
+ */
+
+/* Run a libpoly compute program with the bound resources of stage st */
+static void
+panfrost_launch_poly_compute(struct panfrost_batch *batch, mesa_shader_stage st,
+                             struct panfrost_compiled_shader *cs,
+                             unsigned wg_x, unsigned grid_x, unsigned grid_y)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_compiled_shader *saved = ctx->prog[st];
+   ctx->prog[st] = cs;
+
+   batch->stack_size = MAX2(batch->stack_size, cs->info.tls_size);
+
+   unsigned nr_ubos = 0, nr_push = 0;
+   struct panfrost_poly_compute c = {
+      .grid = {grid_x, grid_y, 1},
+      .block = {wg_x, 1, 1},
+   };
+
+   c.rsd = panfrost_emit_compute_shader_meta(batch, st);
+   c.textures = panfrost_emit_texture_descriptors(batch, st);
+   c.samplers = panfrost_emit_sampler_descriptors(batch, st);
+   c.attribs = panfrost_emit_image_texbuf_attribs(batch, &c.attrib_bufs, st);
+   c.ubos = panfrost_emit_const_buf(batch, st, &nr_ubos, &c.push, &nr_push);
+
+   GENX(jm_launch_poly_compute)(batch, &c);
+   batch->compute_count++;
+
+   ctx->prog[st] = saved;
+}
+
+/* Emit the vertex-stage descriptors of the rasterization draw for a program
+ * that uses the resources bound to stage st.
+ */
+static void
+panfrost_emit_poly_rast_state(struct panfrost_batch *batch,
+                              mesa_shader_stage st,
+                              struct panfrost_compiled_shader *rast)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   const mesa_shader_stage vs = MESA_SHADER_VERTEX;
+   struct panfrost_compiled_shader *saved = ctx->prog[st];
+
+   ctx->prog[st] = rast;
+   batch->stack_size = MAX2(batch->stack_size, rast->info.tls_size);
+
+   batch->rsd[vs] = panfrost_emit_compute_shader_meta(batch, st);
+   batch->textures[vs] = panfrost_emit_texture_descriptors(batch, st);
+   batch->samplers[vs] = panfrost_emit_sampler_descriptors(batch, st);
+   batch->attribs[vs] =
+      panfrost_emit_image_texbuf_attribs(batch, &batch->attrib_bufs[vs], st);
+   batch->uniform_buffers[vs] = panfrost_emit_const_buf(
+      batch, st, &batch->nr_uniform_buffers[vs], &batch->push_uniforms[vs],
+      &batch->nr_push_uniforms[vs]);
+
+   ctx->prog[st] = saved;
+   ctx->prog[vs] = rast;
+}
+
+/*
+ * Run the vertex shader of a draw feeding a geometry or tessellation control
+ * shader as a compute job (hardware attribute fetch, like the transform
+ * feedback program) over the vertex range of the draw, storing its outputs
+ * to memory. Fills in and uploads the vertex parameters.
+ */
+static void
+panfrost_poly_run_vs(struct panfrost_batch *batch,
+                     const struct pipe_draw_info *info, unsigned drawid_offset,
+                     const struct pipe_draw_start_count_bias *draw,
+                     struct poly_vertex_params *vp)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_uncompiled_shader *vs_so = ctx->uncompiled[MESA_SHADER_VERTEX];
+
+   ctx->vertex_count =
+      draw->count + (info->index_size ? abs(draw->index_bias) : 0);
+   ctx->instance_count = info->instance_count;
+   ctx->base_vertex = info->index_size ? draw->index_bias : 0;
+   ctx->base_instance = info->start_instance;
+   ctx->drawid = drawid_offset;
+
+   struct panfrost_shader_key vs_key = {.vs.outputs_to_memory = true};
+   struct panfrost_compiled_shader *vs_mem =
+      panfrost_get_variant(ctx, vs_so, &vs_key);
+   ctx->prog[MESA_SHADER_VERTEX] = vs_mem;
+   batch->stack_size = MAX2(batch->stack_size, vs_mem->info.tls_size);
+
+   unsigned vertex_count =
+      panfrost_draw_get_vertex_count(batch, info, draw, false);
+
+   uint32_t wg_one[3] = {1, 1, 1};
+   poly_vertex_params_init(vp, vs_so->outputs_written, wg_one);
+   vp->verts_per_instance = vertex_count;
+   vp->grid[0] = draw->count;
+   vp->grid[1] = info->instance_count;
+
+   if (info->index_size) {
+      vp->hw_indexed = 1;
+      vp->index_buffer = batch->indices;
+      vp->index_size_B = info->index_size;
+      vp->index_buffer_range_el = draw->count;
+      vp->index_min = ctx->offset_start - draw->index_bias;
+   }
+
+   size_t vs_out_size =
+      poly_tcs_in_size(vertex_count * info->instance_count, vp->outputs);
+   vp->output_buffer =
+      pan_pool_alloc_aligned(&batch->invisible_pool.base,
+                             MAX2(vs_out_size, 16), 64).gpu;
+
+   ctx->poly.vp =
+      pan_pool_upload_aligned(&batch->pool.base, vp, sizeof(*vp), 64);
+
+   ctx->dirty |= PAN_DIRTY_PARAMS;
+   ctx->dirty_shader[MESA_SHADER_VERTEX] |= PAN_DIRTY_STAGE_SHADER;
+
+   panfrost_update_state_3d(batch);
+   panfrost_update_shader_state(batch, MESA_SHADER_VERTEX);
+
+   GENX(jm_launch_xfb)(batch, info, vertex_count);
+   batch->compute_count++;
+}
+
+static void
+panfrost_draw_with_gs(struct panfrost_batch *batch,
+                      const struct pipe_draw_info *info, unsigned drawid_offset,
+                      const struct pipe_draw_start_count_bias *draw)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_gs_progs *gs = ctx->uncompiled[MESA_SHADER_GEOMETRY]->gs;
+   const struct poly_gs_info *gsi = &gs->info;
+
+   assert(!info->primitive_restart && "lowered in draw_vbo");
+
+   unsigned prims = u_decomposed_prims_for_vertices(info->mode, draw->count);
+   if (!prims)
+      return;
+
+   /* GLES: rasterizer discard without transform feedback of the geometry
+    * shader leaves nothing observable (no side effects in geometry shaders).
+    * TODO: transform feedback and primitive queries with geometry shaders.
+    */
+   if (panfrost_batch_skip_rasterization(batch))
+      return;
+
+   struct panfrost_compiled_shader *saved_vs = ctx->prog[MESA_SHADER_VERTEX];
+
+   struct poly_geometry_params gp;
+   uint32_t wg_gs[3] = {gs->wg_size, 1, 1};
+   poly_geometry_params_init(&gp, info->mode, wg_gs);
+   poly_geometry_params_set_draw(&gp, info->mode, gsi->shape, gsi->max_indices,
+                                 draw->count, info->instance_count);
+
+   struct pan_ptr sink = pan_pool_alloc_aligned(&batch->pool.base, 64, 64);
+   memset(sink.cpu, 0, 64);
+
+   for (unsigned i = 0; i < POLY_MAX_VERTEX_STREAMS; ++i) {
+      gp.prims_generated_counter[i] = sink.gpu;
+      gp.xfb_prims_generated_counter[i] = sink.gpu;
+      gp.xfb_overflow[i] = sink.gpu;
+   }
+   gp.xfb_any_overflow = sink.gpu;
+   for (unsigned i = 0; i < POLY_MAX_SO_BUFFERS; ++i)
+      gp.xfb_offs_ptrs[i] = sink.gpu;
+
+   unsigned index_count = gp.draw.index_count;
+   if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+      gp.output_index_buffer =
+         pan_pool_alloc_aligned(&batch->invisible_pool.base,
+                                MAX2(index_count * 4, 16), 64).gpu;
+   }
+
+   ctx->poly.gp = pan_pool_upload_aligned(&batch->pool.base, &gp, sizeof(gp), 64);
+   ctx->poly.tp = 0;
+   ctx->poly.sink = sink.gpu;
+   ctx->poly.provoking_last = !ctx->rasterizer->base.flatshade_first;
+
+   /* 1. The vertex shader, storing its outputs to memory */
+   struct poly_vertex_params vp;
+   panfrost_poly_run_vs(batch, info, drawid_offset, draw, &vp);
+
+   /* 2. The main geometry program writes the index buffer */
+   if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+      struct panfrost_shader_key key = {0};
+      struct panfrost_compiled_shader *main_cs =
+         panfrost_get_variant(ctx, gs->main, &key);
+
+      panfrost_launch_poly_compute(batch, MESA_SHADER_GEOMETRY, main_cs,
+                                   gs->wg_size, DIV_ROUND_UP(prims, gs->wg_size),
+                                   info->instance_count);
+   }
+
+   /* 3. The rasterization draw */
+   struct pipe_draw_info rast_info = {
+      .mode = gsi->mode,
+      .instance_count = 1,
+   };
+   struct pipe_draw_start_count_bias rast_draw = {0};
+   unsigned rast_vertices = 0;
+
+   switch (gsi->shape) {
+   case POLY_GS_SHAPE_DYNAMIC_INDEXED:
+      rast_info.index_size = 4;
+      rast_info.primitive_restart = true;
+      rast_info.restart_index = ~0;
+      rast_draw.count = index_count;
+      batch->indices = gp.output_index_buffer;
+      rast_vertices = (info->instance_count << gp.primitives_log2) *
+                      gs->vertex_stride;
+      break;
+
+   case POLY_GS_SHAPE_STATIC_INDEXED: {
+      rast_info.index_size = 1;
+      rast_info.primitive_restart = true;
+      rast_info.restart_index = 0xFF;
+      rast_info.instance_count = gp.draw.instance_count;
+      rast_draw.count = gsi->max_indices;
+      batch->indices = pan_pool_upload_aligned(
+         &batch->pool.base, gsi->topology, gsi->max_indices, 4);
+
+      for (unsigned i = 0; i < gsi->max_indices; ++i) {
+         if (gsi->topology[i] != 0xFF)
+            rast_vertices = MAX2(rast_vertices, gsi->topology[i] + 1);
+      }
+      break;
+   }
+
+   case POLY_GS_SHAPE_STATIC_PER_PRIM:
+   case POLY_GS_SHAPE_STATIC_PER_INSTANCE:
+      rast_info.instance_count = gp.draw.instance_count;
+      rast_draw.count = gp.draw.index_count;
+      rast_vertices = rast_draw.count;
+      batch->indices = 0;
+      break;
+   }
+
+   if (rast_draw.count == 0 || rast_vertices == 0 ||
+       rast_info.instance_count == 0)
+      goto out;
+
+   struct panfrost_shader_key rast_key = {
+      .vs.noperspective_varyings =
+         ctx->uncompiled[MESA_SHADER_FRAGMENT]->noperspective_varyings,
+   };
+   struct panfrost_compiled_shader *rast =
+      panfrost_get_variant(ctx, gs->rast, &rast_key);
+   bool idvs = rast->info.vs.idvs;
+
+   panfrost_update_active_prim(ctx, &rast_info);
+
+   ctx->offset_start = 0;
+   ctx->base_vertex = 0;
+   ctx->base_instance = 0;
+   ctx->vertex_count = rast_vertices;
+   ctx->instance_count = rast_info.instance_count;
+
+   if (rast_info.instance_count > 1) {
+      ctx->padded_count =
+         pan_padded_vertex_count(idvs ? ALIGN_POT(rast_vertices, 4)
+                                      : rast_vertices);
+   } else {
+      ctx->padded_count = rast_vertices;
+   }
+
+   panfrost_increase_vertex_count(batch, rast_vertices);
+
+   panfrost_emit_poly_rast_state(batch, MESA_SHADER_GEOMETRY, rast);
+   panfrost_update_shader_state(batch, MESA_SHADER_FRAGMENT);
+   panfrost_clean_state_3d(ctx);
+
+   panfrost_bi_emit_varying_descriptor(batch,
+                                       ctx->padded_count * ctx->instance_count,
+                                       rast_info.mode == MESA_PRIM_POINTS);
+
+   batch->vertex_barrier = true;
+   GENX(jm_launch_draw)(batch, &rast_info, drawid_offset, &rast_draw,
+                        rast_vertices);
+   batch->vertex_barrier = false;
+   batch->draw_count++;
+
+out:
+   /* The vertex-stage descriptors now belong to other programs */
+   ctx->prog[MESA_SHADER_VERTEX] = saved_vs;
+   ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_VERTEX;
+   ctx->dirty_shader[MESA_SHADER_VERTEX] = ~0;
+   ctx->dirty_shader[MESA_SHADER_GEOMETRY] = ~0;
+}
+#endif
+
+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
+/*
+ * Tessellation, lowered with libpoly. A draw becomes:
+ *
+ *    1. the vertex shader as a compute job storing its outputs to memory;
+ *    2. the control shader as a compute job, one workgroup per patch;
+ *    3. the tessellator (libpan kernels): count the indices and domain points
+ *       of each patch, prefix sum them and write the vertex and index counts
+ *       into the jobs of the rasterization draw, then tessellate;
+ *    4. the rasterization draw: a vertex job running the evaluation shader
+ *       once per domain point, and a tiler job drawing the tessellator's
+ *       index buffer.
+ *
+ * The Arm driver does the same on this GPU: compute jobs between the vertex
+ * job and the draw, and a draw whose counts the GPU writes.
+ *
+ * The CPU does not know the tessellation levels: buffers are sized for the
+ * maximum level (64).
+ */
+#define PAN_TESS_MAX_POINTS  (65 * 65)
+#define PAN_TESS_MAX_INDICES (6 * 65 * 65)
+
+static enum mesa_prim
+panfrost_tess_output_prim(const struct panfrost_tess_progs *tcs,
+                          const struct panfrost_tess_progs *tes)
+{
+   if (tcs->point_mode || tes->point_mode)
+      return MESA_PRIM_POINTS;
+   else if (MAX2(tcs->primitive, tes->primitive) == TESS_PRIMITIVE_ISOLINES)
+      return MESA_PRIM_LINES;
+   else
+      return MESA_PRIM_TRIANGLES;
+}
+
+static void
+panfrost_draw_with_tess(struct panfrost_batch *batch,
+                        const struct pipe_draw_info *info,
+                        unsigned drawid_offset,
+                        const struct pipe_draw_start_count_bias *draw)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_tess_progs *tcs = ctx->uncompiled[MESA_SHADER_TESS_CTRL]->tess;
+   struct panfrost_tess_progs *tes = ctx->uncompiled[MESA_SHADER_TESS_EVAL]->tess;
+
+   assert(!info->primitive_restart && "lowered in draw_vbo");
+
+   unsigned patch_vertices = ctx->patch_vertices;
+   unsigned in_patches = patch_vertices ? draw->count / patch_vertices : 0;
+   if (in_patches == 0)
+      return;
+
+   /* TODO: transform feedback and primitive queries with tessellation */
+   if (panfrost_batch_skip_rasterization(batch))
+      return;
+
+   unsigned nr_patches = in_patches * info->instance_count;
+   struct panfrost_compiled_shader *saved_vs = ctx->prog[MESA_SHADER_VERTEX];
+
+   enum tess_primitive_mode mode = MAX2(tcs->primitive, tes->primitive);
+   enum gl_tess_spacing spacing = MAX2(tcs->spacing, tes->spacing);
+   enum mesa_prim out_prim = panfrost_tess_output_prim(tcs, tes);
+
+   enum pipe_tess_spacing pspacing =
+      spacing == TESS_SPACING_EQUAL           ? PIPE_TESS_SPACING_EQUAL
+      : spacing == TESS_SPACING_FRACTIONAL_ODD ? PIPE_TESS_SPACING_FRACTIONAL_ODD
+                                               : PIPE_TESS_SPACING_FRACTIONAL_EVEN;
+
+   struct pan_pool *gpu_pool = &batch->invisible_pool.base;
+   size_t max_points = (size_t)nr_patches * PAN_TESS_MAX_POINTS;
+   size_t max_indices = (size_t)nr_patches * PAN_TESS_MAX_INDICES;
+
+   struct poly_tess_params tp = {
+      .tcs_stride_el = tcs->output_stride / 4,
+      .input_patch_size = patch_vertices,
+      .output_patch_size = tcs->output_patch_size,
+      .tcs_patch_constants = tcs->nr_patch_outputs,
+      .tcs_per_vertex_outputs = tcs->per_vertex_outputs,
+      .patches_per_instance = in_patches,
+      .nr_patches = nr_patches,
+      .partitioning = (enum poly_tess_partitioning)pspacing,
+      .points_mode = out_prim == MESA_PRIM_POINTS,
+      .isolines = mode == TESS_PRIMITIVE_ISOLINES,
+   };
+
+   if (out_prim == MESA_PRIM_TRIANGLES)
+      tp.ccw = !tes->ccw;
+
+   memcpy(tp.tess_level_outer_default, ctx->default_outer_level,
+          sizeof(ctx->default_outer_level));
+   memcpy(tp.tess_level_inner_default, ctx->default_inner_level,
+          sizeof(ctx->default_inner_level));
+
+   tp.tcs_buffer =
+      pan_pool_alloc_aligned(gpu_pool, nr_patches * tcs->output_stride, 64).gpu;
+   tp.coord_allocs = pan_pool_alloc_aligned(gpu_pool, nr_patches * 4, 64).gpu;
+   tp.counts = pan_pool_alloc_aligned(gpu_pool, nr_patches * 4, 64).gpu;
+   tp.point_counts = pan_pool_alloc_aligned(gpu_pool, nr_patches * 4, 64).gpu;
+   tp.patch_coord_buffer =
+      pan_pool_alloc_aligned(gpu_pool, max_points * 8, 64).gpu;
+   tp.index_buffer = pan_pool_alloc_aligned(gpu_pool, max_indices * 4, 64).gpu;
+
+   ctx->poly.tp = pan_pool_upload_aligned(&batch->pool.base, &tp, sizeof(tp), 64);
+   ctx->poly.gp = 0;
+   ctx->poly.sink = 0;
+   ctx->poly.provoking_last = !ctx->rasterizer->base.flatshade_first;
+
+   /* 1. The vertex shader, storing its outputs to memory */
+   struct poly_vertex_params vp;
+   panfrost_poly_run_vs(batch, info, drawid_offset, draw, &vp);
+
+   /* 2. The control shader */
+   struct panfrost_shader_key key = {0};
+   panfrost_launch_poly_compute(batch, MESA_SHADER_TESS_CTRL,
+                                panfrost_get_variant(ctx, tcs->tcs, &key),
+                                tcs->output_patch_size, in_patches,
+                                info->instance_count);
+
+   /* 3. The tessellator */
+   struct pan_ptr jobs = pan_pool_alloc_aligned(&batch->pool.base, 16, 8);
+   struct panlib_precomp_grid tess_grid = panlib_1d(nr_patches);
+
+   panlib_tessellate(batch, tess_grid, PANLIB_BARRIER_JM_BARRIER, ctx->poly.tp,
+                     mode, POLY_TESS_MODE_COUNT);
+   panlib_tess_prefix_sum_patch(batch, panlib_1d(1),
+                                PANLIB_BARRIER_JM_BARRIER |
+                                   PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+                                ctx->poly.tp, jobs.gpu);
+   panlib_tessellate(batch, tess_grid, PANLIB_BARRIER_JM_BARRIER, ctx->poly.tp,
+                     mode, POLY_TESS_MODE_WITH_COUNTS);
+   batch->compute_count += 3;
+
+   /* 4. The rasterization draw, its counts written by the GPU */
+   struct pipe_draw_info rast_info = {
+      .mode = out_prim,
+      .index_size = 4,
+      .primitive_restart = true,
+      .restart_index = ~0,
+      .instance_count = 1,
+   };
+   struct pipe_draw_start_count_bias rast_draw = {.count = max_indices};
+
+   struct panfrost_shader_key rast_key = {
+      .vs.noperspective_varyings =
+         ctx->uncompiled[MESA_SHADER_FRAGMENT]->noperspective_varyings,
+   };
+   struct panfrost_compiled_shader *rast =
+      panfrost_get_variant(ctx, tes->tes, &rast_key);
+   assert(!rast->info.vs.idvs);
+
+   panfrost_update_active_prim(ctx, &rast_info);
+
+   ctx->offset_start = 0;
+   ctx->base_vertex = 0;
+   ctx->base_instance = 0;
+   ctx->vertex_count = max_points;
+   ctx->instance_count = 1;
+   ctx->padded_count = max_points;
+   batch->indices = tp.index_buffer;
+
+   panfrost_increase_vertex_count(batch, max_points);
+
+   panfrost_emit_poly_rast_state(batch, MESA_SHADER_TESS_EVAL, rast);
+   panfrost_update_shader_state(batch, MESA_SHADER_FRAGMENT);
+   panfrost_clean_state_3d(ctx);
+
+   panfrost_bi_emit_varying_descriptor(batch, max_points,
+                                       out_prim == MESA_PRIM_POINTS);
+
+   batch->vertex_barrier = true;
+   GENX(jm_launch_draw)(batch, &rast_info, drawid_offset, &rast_draw,
+                        max_points);
+   batch->vertex_barrier = false;
+   batch->draw_count++;
+
+   uint64_t *job_ptrs = jobs.cpu;
+   job_ptrs[0] = batch->last_vertex_job;
+   job_ptrs[1] = batch->last_tiler_job;
+
+   ctx->prog[MESA_SHADER_VERTEX] = saved_vs;
+   ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_VERTEX;
+   ctx->dirty_shader[MESA_SHADER_VERTEX] = ~0;
+   ctx->dirty_shader[MESA_SHADER_TESS_CTRL] = ~0;
+   ctx->dirty_shader[MESA_SHADER_TESS_EVAL] = ~0;
+}
+#endif
+
 static void
 panfrost_single_draw_direct(struct panfrost_batch *batch,
                             const struct pipe_draw_info *info,
@@ -3426,6 +3943,19 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
       return;
 
    struct panfrost_context *ctx = batch->ctx;
+
+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
+   if (ctx->uncompiled[MESA_SHADER_TESS_EVAL]) {
+      /* TODO: geometry shaders after tessellation */
+      panfrost_draw_with_tess(batch, info, drawid_offset, draw);
+      return;
+   }
+
+   if (ctx->uncompiled[MESA_SHADER_GEOMETRY]) {
+      panfrost_draw_with_gs(batch, info, drawid_offset, draw);
+      return;
+   }
+#endif
 
    panfrost_update_active_prim(ctx, info);
 
@@ -3664,6 +4194,27 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
 
    ctx->draw_calls++;
+
+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
+   /* Geometry shader and tessellation draws apply the input topology in
+    * compute programs, which do not know about primitive restart: split the
+    * draw on the CPU.
+    */
+   if ((ctx->uncompiled[MESA_SHADER_GEOMETRY] ||
+        ctx->uncompiled[MESA_SHADER_TESS_EVAL]) &&
+       info->primitive_restart && info->index_size) {
+      if (indirect && indirect->buffer) {
+         util_draw_indirect(pipe, info, drawid_offset, indirect);
+         return;
+      }
+
+      for (unsigned i = 0; i < num_draws; ++i) {
+         util_draw_vbo_without_prim_restart(pipe, info, drawid_offset, NULL,
+                                            &draws[i]);
+      }
+      return;
+   }
+#endif
 
    if (indirect && indirect->buffer) {
       assert(num_draws == 1);

@@ -564,6 +564,13 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       case MESA_SHADER_FRAGMENT:
       case MESA_SHADER_COMPUTE:
          break;
+      case MESA_SHADER_GEOMETRY:
+      case MESA_SHADER_TESS_CTRL:
+      case MESA_SHADER_TESS_EVAL:
+         /* Lowered to compute with libpoly, job manager Bifrost only */
+         if (dev->arch >= 6 && dev->arch <= 7)
+            break;
+         continue;
       default:
          continue;
       }
@@ -571,8 +578,10 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       /* We only allow observable side effects (memory writes) in compute and
        * fragment shaders. Side effects in the geometry pipeline cause
        * trouble with IDVS and conflict with our transform feedback lowering.
+       * Geometry shaders run more than once per primitive (libpoly).
        */
-      bool allow_side_effects = (i != MESA_SHADER_VERTEX);
+      bool allow_side_effects =
+         (i == MESA_SHADER_FRAGMENT || i == MESA_SHADER_COMPUTE);
 
       caps->max_instructions =
       caps->max_alu_instructions =
@@ -773,6 +782,16 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->stream_output_interleave_buffers = true;
 
    caps->max_texture_array_layers = 2048;
+
+   if (dev->arch >= 6 && dev->arch <= 7) {
+      caps->max_geometry_output_vertices = 256;
+      caps->max_geometry_total_output_components = 1024;
+      caps->max_gs_invocations = 32;
+      caps->max_vertex_streams = 1;
+      caps->max_shader_patch_varyings = 32;
+      /* libpoly reads tessellation levels as patch inputs */
+      caps->glsl_tess_levels_as_inputs = true;
+   }
 
    caps->glsl_feature_level =
    caps->glsl_feature_level_compatibility = is_gl3 ? 330 : 140;

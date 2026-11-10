@@ -32,6 +32,7 @@
 #include "panfrost_perfetto.h"
 
 #include "compiler/shader_enums.h"
+#include "poly/nir/poly_nir.h"
 #include "midgard/midgard_compile.h"
 
 #include "pan_csf.h"
@@ -221,6 +222,11 @@ struct panfrost_context {
    struct panfrost_zsa_state *depth_stencil;
    struct pipe_stencil_ref stencil_ref;
    uint16_t sample_mask;
+
+   /* Tessellation: vertices per input patch, default levels (no TCS) */
+   uint8_t patch_vertices;
+   float default_outer_level[4];
+   float default_inner_level[2];
    unsigned min_samples;
 
    struct panfrost_query *cond_query;
@@ -251,6 +257,21 @@ struct panfrost_context {
    struct panfrost_perfetto_state perfetto;
 #endif
    uint32_t submit_count; /* monotonic submit ID for perfetto */
+
+   /* Geometry and tessellation shaders are lowered to compute programs with
+    * libpoly. GPU addresses of the parameter structures of the draw being
+    * emitted, read by the sysvals of the lowered programs.
+    */
+   struct {
+      uint64_t vp, gp, tp;
+
+      /* Zeroed memory for out-of-bounds index reads and counters nobody
+       * reads back.
+       */
+      uint64_t sink;
+
+      uint32_t provoking_last;
+   } poly;
 };
 
 /* Corresponds to the CSO */
@@ -307,6 +328,16 @@ enum {
    PAN_SYSVAL_NUM_VERTICES = 18,
    PAN_SYSVAL_PRINTF_BUFFER = 19,
    PAN_SYSVAL_IMAGE_SAMPLES = 20,
+   PAN_SYSVAL_POLY = 21,
+};
+
+/* IDs of PAN_SYSVAL_POLY */
+enum {
+   PAN_SYSVAL_POLY_VERTEX_PARAMS = 0,
+   PAN_SYSVAL_POLY_GEOMETRY_PARAMS = 1,
+   PAN_SYSVAL_POLY_TESS_PARAMS = 2,
+   PAN_SYSVAL_POLY_SINK = 3,
+   PAN_SYSVAL_POLY_PROVOKING_LAST = 4,
 };
 
 #define PAN_TXS_SYSVAL_ID(texidx, dim, is_array)                               \
@@ -380,6 +411,12 @@ struct panfrost_vs_key {
     * feedback shader, else it is a regular vertex shader. */
    bool is_xfb;
 
+   /* The vertex (or tessellation evaluation) shader feeds a geometry or
+    * tessellation control shader: it runs as a compute job and stores its
+    * outputs to memory for the next stage (libpoly lowering).
+    */
+   bool outputs_to_memory;
+
    /* Bit mask of varyings in the linked FS that use noperspective
     * interpolation, starting at VARYING_SLOT_VAR0 */
    uint32_t noperspective_varyings;
@@ -415,6 +452,60 @@ struct panfrost_compiled_shader {
    unsigned dirty_3d, dirty_shader;
 };
 
+struct panfrost_uncompiled_shader;
+
+/* Geometry shader lowered with libpoly. Each program is its own CSO so that
+ * the disk cache keys them apart.
+ */
+struct panfrost_gs_progs {
+   struct poly_gs_info info;
+
+   /* Main geometry program (compute, one invocation per input primitive and
+    * instance). Writes the index buffer for dynamic topologies.
+    */
+   struct panfrost_uncompiled_shader *main;
+
+   /* Optional: writes the per-primitive counts (transform feedback/queries) */
+   struct panfrost_uncompiled_shader *count;
+
+   /* 1x1x1 compute program updating counters (transform feedback/queries) */
+   struct panfrost_uncompiled_shader *pre_gs;
+
+   /* Hardware vertex shader of the rasterization draw: re-runs the geometry
+    * shader for each output vertex.
+    */
+   struct panfrost_uncompiled_shader *rast;
+
+   /* Workgroup width of the main program */
+   unsigned wg_size;
+
+   /* Power-of-two number of output vertices per primitive, for dynamic
+    * topologies
+    */
+   unsigned vertex_stride;
+};
+
+/* Tessellation shaders lowered with libpoly */
+struct panfrost_tess_progs {
+   enum tess_primitive_mode primitive;
+   enum gl_tess_spacing spacing;
+   bool ccw, point_mode;
+
+   /* Control shader: compute program, one workgroup per patch, one
+    * invocation per output vertex.
+    */
+   struct panfrost_uncompiled_shader *tcs;
+   uint64_t per_vertex_outputs;
+   unsigned output_stride;
+   unsigned nr_patch_outputs;
+   unsigned output_patch_size;
+
+   /* Evaluation shader: hardware vertex shader of the rasterization draw, one
+    * invocation per domain point.
+    */
+   struct panfrost_uncompiled_shader *tes;
+};
+
 /* Shader CSO */
 struct panfrost_uncompiled_shader {
    /* NIR for the shader. For graphics, this will be non-NULL even for
@@ -440,6 +531,17 @@ struct panfrost_uncompiled_shader {
 
    /* Compiled transform feedback program, if one is required */
    struct panfrost_compiled_shader *xfb;
+
+   /* Geometry shaders: the lowered programs */
+   struct panfrost_gs_progs *gs;
+
+   /* Tessellation control/evaluation shaders: the lowered program */
+   struct panfrost_tess_progs *tess;
+
+   /* Vertex and tessellation evaluation shaders: mask of outputs written,
+    * for the memory layout of outputs_to_memory variants.
+    */
+   uint64_t outputs_written;
 
    /* On fragments shaders, bit mask of varyings using noprespective
     * interpolation, starting at VARYING_SLOT_VAR0 */
@@ -552,6 +654,23 @@ uint64_t panfrost_vertex_buffer_address(struct panfrost_context *ctx,
                                         unsigned i);
 
 void panfrost_shader_context_init(struct pipe_context *pctx);
+
+/* libpoly lowering of geometry and tessellation shaders (pan_nir_lower_poly.c) */
+bool panfrost_nir_lower_poly_misc(nir_shader *nir);
+bool panfrost_nir_widen_poly_io(nir_shader *nir);
+bool panfrost_nir_lower_vs_to_memory(nir_shader *nir);
+void panfrost_nir_lower_gs(const nir_shader *nir, struct poly_gs_info *info,
+                           nir_shader **main_out, nir_shader **count_out,
+                           nir_shader **pre_gs_out, nir_shader **rast_out,
+                           unsigned *wg_size, unsigned *vertex_stride);
+nir_shader *panfrost_nir_lower_tcs(const nir_shader *nir);
+nir_shader *panfrost_nir_lower_tes(const nir_shader *nir);
+
+/* Variant of a shader for the current state (pan_shader.c) */
+struct panfrost_compiled_shader *
+panfrost_get_variant(struct panfrost_context *ctx,
+                     struct panfrost_uncompiled_shader *uncompiled,
+                     const struct panfrost_shader_key *key);
 
 static inline void
 panfrost_dirty_state_all(struct panfrost_context *ctx)

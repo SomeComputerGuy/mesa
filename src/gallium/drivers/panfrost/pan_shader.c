@@ -120,9 +120,18 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
    };
 
    /* Lower this early so the backends don't have to worry about it */
-   if (s->info.stage == MESA_SHADER_VERTEX) {
-      /* No IDVS for internal XFB shaders */
-      inputs.no_idvs = s->info.has_transform_feedback_varyings;
+   if (s->info.stage == MESA_SHADER_VERTEX && key->vs.outputs_to_memory) {
+      /* Feeds a geometry/tessellation control shader: runs as a compute job
+       * storing its outputs to memory, no varyings.
+       */
+      NIR_PASS(_, s, panfrost_nir_lower_vs_to_memory);
+      inputs.no_idvs = true;
+   } else if (s->info.stage == MESA_SHADER_VERTEX) {
+      /* No IDVS for internal XFB shaders. Tessellation evaluation shaders
+       * run in a vertex job whose size the GPU patches.
+       */
+      inputs.no_idvs = s->info.has_transform_feedback_varyings ||
+                       s->info.vs.tes_poly;
 
       if (s->info.has_transform_feedback_varyings) {
          NIR_PASS(_, s, nir_opt_constant_folding);
@@ -373,7 +382,7 @@ panfrost_build_key(struct panfrost_context *ctx,
 static struct panfrost_compiled_shader *
 panfrost_new_variant_locked(struct panfrost_context *ctx,
                             struct panfrost_uncompiled_shader *uncompiled,
-                            struct panfrost_shader_key *key)
+                            const struct panfrost_shader_key *key)
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
    struct panfrost_compiled_shader *prog = panfrost_alloc_variant(uncompiled);
@@ -389,6 +398,30 @@ panfrost_new_variant_locked(struct panfrost_context *ctx,
    prog->earlyzs = pan_earlyzs_analyze(&prog->info, dev->arch);
 
    return prog;
+}
+
+struct panfrost_compiled_shader *
+panfrost_get_variant(struct panfrost_context *ctx,
+                     struct panfrost_uncompiled_shader *uncompiled,
+                     const struct panfrost_shader_key *key)
+{
+   struct panfrost_compiled_shader *compiled = NULL;
+
+   simple_mtx_lock(&uncompiled->lock);
+
+   util_dynarray_foreach(&uncompiled->variants, struct panfrost_compiled_shader,
+                         so) {
+      if (memcmp(key, &so->key, sizeof(*key)) == 0) {
+         compiled = so;
+         break;
+      }
+   }
+
+   if (compiled == NULL)
+      compiled = panfrost_new_variant_locked(ctx, uncompiled, key);
+
+   simple_mtx_unlock(&uncompiled->lock);
+   return compiled;
 }
 
 static void
@@ -410,8 +443,10 @@ void
 panfrost_update_shader_variant(struct panfrost_context *ctx,
                                mesa_shader_stage type)
 {
-   /* No shader variants for compute */
-   if (type == MESA_SHADER_COMPUTE)
+   /* No shader variants for compute. Geometry and tessellation shaders are
+    * lowered to programs selected at draw time.
+    */
+   if (type != MESA_SHADER_VERTEX && type != MESA_SHADER_FRAGMENT)
       return;
 
    /* We need linking information, defer this */
@@ -459,6 +494,24 @@ panfrost_bind_vs_state(struct pipe_context *pctx, void *hwcso)
 }
 
 static void
+panfrost_bind_gs_state(struct pipe_context *pctx, void *hwcso)
+{
+   panfrost_bind_shader_state(pctx, hwcso, MESA_SHADER_GEOMETRY);
+}
+
+static void
+panfrost_bind_tcs_state(struct pipe_context *pctx, void *hwcso)
+{
+   panfrost_bind_shader_state(pctx, hwcso, MESA_SHADER_TESS_CTRL);
+}
+
+static void
+panfrost_bind_tes_state(struct pipe_context *pctx, void *hwcso)
+{
+   panfrost_bind_shader_state(pctx, hwcso, MESA_SHADER_TESS_EVAL);
+}
+
+static void
 panfrost_bind_fs_state(struct pipe_context *pctx, void *hwcso)
 {
    panfrost_bind_shader_state(pctx, hwcso, MESA_SHADER_FRAGMENT);
@@ -494,6 +547,96 @@ panfrost_default_shader_key(struct panfrost_uncompiled_shader *so)
    }
 
    return key;
+}
+
+static void
+panfrost_collect_vs_varying_layout(struct panfrost_device *dev,
+                                   struct panfrost_uncompiled_shader *so,
+                                   nir_shader *nir)
+{
+   struct pan_varying_layout *varying_layout = &so->vs_varying_layout;
+   pan_varying_collect_formats(varying_layout, nir, panfrost_device_gpu_id(dev),
+                               false, /* trust_varying_flat_highp_types */
+                               false /* lower_mediump */);
+   pan_build_varying_layout_compact(varying_layout, nir,
+                                    panfrost_device_gpu_id(dev));
+}
+
+/* CSO for a program derived from an application shader (libpoly lowering) */
+static struct panfrost_uncompiled_shader *
+panfrost_create_internal_shader(struct panfrost_context *ctx, nir_shader *nir)
+{
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+   if (nir->info.stage == MESA_SHADER_VERTEX)
+      pan_preprocess_nir(nir, panfrost_device_gpu_id(dev));
+
+   /* Programs built from scratch by libpoly have no default uniform block */
+   nir->info.first_ubo_is_default_ubo = true;
+
+   struct panfrost_uncompiled_shader *so = panfrost_alloc_shader(nir);
+   ralloc_steal(so, nir);
+   so->nir = nir;
+
+   if (nir->info.stage == MESA_SHADER_VERTEX)
+      panfrost_collect_vs_varying_layout(dev, so, nir);
+
+   /* Precompile with the default key */
+   struct panfrost_shader_key key = {0};
+   panfrost_new_variant_locked(ctx, so, &key);
+   return so;
+}
+
+static void panfrost_delete_shader_state(struct pipe_context *pctx, void *so);
+
+static void
+panfrost_create_gs_progs(struct panfrost_context *ctx,
+                         struct panfrost_uncompiled_shader *so)
+{
+   struct panfrost_gs_progs *gs = rzalloc(so, struct panfrost_gs_progs);
+   nir_shader *main_nir, *count_nir, *pre_gs_nir, *rast_nir;
+
+   panfrost_nir_lower_gs(so->nir, &gs->info, &main_nir, &count_nir,
+                         &pre_gs_nir, &rast_nir, &gs->wg_size,
+                         &gs->vertex_stride);
+
+   gs->main = panfrost_create_internal_shader(ctx, main_nir);
+
+   /* The pre-GS program only updates transform feedback and query counters,
+    * not supported with geometry shaders yet.
+    */
+   ralloc_free(pre_gs_nir);
+
+   gs->rast = panfrost_create_internal_shader(ctx, rast_nir);
+   if (count_nir)
+      gs->count = panfrost_create_internal_shader(ctx, count_nir);
+
+   so->gs = gs;
+}
+
+static void
+panfrost_create_tess_progs(struct panfrost_context *ctx,
+                           struct panfrost_uncompiled_shader *so)
+{
+   const nir_shader *nir = so->nir;
+   struct panfrost_tess_progs *t = rzalloc(so, struct panfrost_tess_progs);
+
+   t->primitive = nir->info.tess._primitive_mode;
+   t->spacing = nir->info.tess.spacing;
+   t->ccw = nir->info.tess.ccw;
+   t->point_mode = nir->info.tess.point_mode;
+   t->output_patch_size = nir->info.tess.tcs_vertices_out;
+   t->per_vertex_outputs = poly_tcs_per_vertex_outputs(nir);
+   t->nr_patch_outputs = util_last_bit(nir->info.patch_outputs_written);
+
+   if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
+      t->output_stride = poly_tcs_output_stride(nir);
+      t->tcs = panfrost_create_internal_shader(ctx, panfrost_nir_lower_tcs(nir));
+   } else {
+      t->tes = panfrost_create_internal_shader(ctx, panfrost_nir_lower_tes(nir));
+   }
+
+   so->tess = t;
 }
 
 static void *
@@ -581,19 +724,27 @@ panfrost_create_shader_state(struct pipe_context *pctx,
          pan_nir_collect_noperspective_varyings_fs(nir);
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
-      struct pan_varying_layout *varying_layout = &so->vs_varying_layout;
-      pan_varying_collect_formats(varying_layout, nir,
-                                  panfrost_device_gpu_id(dev),
-                                  false, /* trust_varying_flat_highp_types */
-                                  false /* lower_mediump */);
-      pan_build_varying_layout_compact(varying_layout, nir,
-                                       panfrost_device_gpu_id(dev));
+      panfrost_collect_vs_varying_layout(dev, so, nir);
+      so->outputs_written = nir->info.outputs_written;
+   }
+
+   struct panfrost_context *ctx = pan_context(pctx);
+
+   /* Geometry shaders are lowered to several programs, compiled now */
+   if (nir->info.stage == MESA_SHADER_GEOMETRY) {
+      panfrost_create_gs_progs(ctx, so);
+      return so;
+   }
+
+   if (nir->info.stage == MESA_SHADER_TESS_CTRL ||
+       nir->info.stage == MESA_SHADER_TESS_EVAL) {
+      panfrost_create_tess_progs(ctx, so);
+      return so;
    }
 
    /* If this shader uses transform feedback, compile the transform
     * feedback program. This is a special shader variant.
     */
-   struct panfrost_context *ctx = pan_context(pctx);
 
    if (so->nir->xfb_info) {
       so->xfb = calloc(1, sizeof(struct panfrost_compiled_shader));
@@ -651,6 +802,20 @@ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
       free(cso->xfb);
    }
 
+   if (cso->gs) {
+      panfrost_delete_shader_state(pctx, cso->gs->main);
+      panfrost_delete_shader_state(pctx, cso->gs->rast);
+      if (cso->gs->count)
+         panfrost_delete_shader_state(pctx, cso->gs->count);
+   }
+
+   if (cso->tess) {
+      if (cso->tess->tcs)
+         panfrost_delete_shader_state(pctx, cso->tess->tcs);
+      if (cso->tess->tes)
+         panfrost_delete_shader_state(pctx, cso->tess->tes);
+   }
+
    simple_mtx_destroy(&cso->lock);
 
    ralloc_free(so);
@@ -666,19 +831,19 @@ panfrost_link_shader(struct pipe_context *pctx, void** handles)
    if (!fs || fs->nir->info.separate_shader)
       return;
 
-   /* We only handle VS and FS for now, it's not clear how varying layout will
-    * fit when more shader types are supported.  So assert those are the only
-    * shaders present.
-    */
-   for (unsigned i = 0; i < MESA_SHADER_MESH_STAGES; i++) {
-      if (i != MESA_SHADER_VERTEX && i != MESA_SHADER_FRAGMENT)
-         assert(handles[i] == NULL);
-   }
+   struct panfrost_uncompiled_shader *gs = handles[MESA_SHADER_GEOMETRY];
+   struct panfrost_uncompiled_shader *tes = handles[MESA_SHADER_TESS_EVAL];
 
-   /* Only copy the varying layout if we have a VS, sometimes we don't have one
+   /* The FS is linked with the hardware vertex shader of the rasterization
+    * draw: the geometry shader's rasterization program, else the tessellation
+    * evaluation shader, else the vertex shader. Sometimes there is no VS
     * (e.g. fixed-function VS), in those cases we just compile a default FS.
     */
-   if (vs)
+   if (gs && gs->gs)
+      fs->vs_varying_layout = gs->gs->rast->vs_varying_layout;
+   else if (tes && tes->tess)
+      fs->vs_varying_layout = tes->tess->tes->vs_varying_layout;
+   else if (vs)
       fs->vs_varying_layout = vs->vs_varying_layout;
 
    simple_mtx_lock(&fs->lock);
@@ -750,6 +915,18 @@ panfrost_shader_context_init(struct pipe_context *pctx)
    pctx->create_vs_state = panfrost_create_shader_state;
    pctx->delete_vs_state = panfrost_delete_shader_state;
    pctx->bind_vs_state = panfrost_bind_vs_state;
+
+   pctx->create_tcs_state = panfrost_create_shader_state;
+   pctx->delete_tcs_state = panfrost_delete_shader_state;
+   pctx->bind_tcs_state = panfrost_bind_tcs_state;
+
+   pctx->create_tes_state = panfrost_create_shader_state;
+   pctx->delete_tes_state = panfrost_delete_shader_state;
+   pctx->bind_tes_state = panfrost_bind_tes_state;
+
+   pctx->create_gs_state = panfrost_create_shader_state;
+   pctx->delete_gs_state = panfrost_delete_shader_state;
+   pctx->bind_gs_state = panfrost_bind_gs_state;
 
    pctx->create_fs_state = panfrost_create_shader_state;
    pctx->delete_fs_state = panfrost_delete_shader_state;

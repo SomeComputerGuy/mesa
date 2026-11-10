@@ -21,6 +21,12 @@ panfrost_blitter_save(struct panfrost_context *ctx,
    util_blitter_save_vertex_elements(blitter, ctx->vertex);
    util_blitter_save_vertex_shader(blitter,
                                    ctx->uncompiled[MESA_SHADER_VERTEX]);
+   util_blitter_save_geometry_shader(blitter,
+                                     ctx->uncompiled[MESA_SHADER_GEOMETRY]);
+   util_blitter_save_tessctrl_shader(blitter,
+                                     ctx->uncompiled[MESA_SHADER_TESS_CTRL]);
+   util_blitter_save_tesseval_shader(blitter,
+                                     ctx->uncompiled[MESA_SHADER_TESS_EVAL]);
    util_blitter_save_rasterizer(blitter, ctx->rasterizer);
    util_blitter_save_viewport(blitter, &ctx->pipe_viewport);
    util_blitter_save_so_targets(blitter, 0, NULL, 0);
