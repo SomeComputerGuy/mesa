@@ -621,6 +621,11 @@ bi_can_add(bi_instr *ins)
 static bool
 bi_must_not_last(bi_instr *ins)
 {
+   /* SEG_ADD.i64 has one destination but is lowered to *SEG_ADD and
+    * +SEG_ADD in the same tuple, writing two registers */
+   if (ins->op == BI_OPCODE_SEG_ADD_I64)
+      return true;
+
    return (ins->nr_dests >= 2) && (ins->op != BI_OPCODE_TEXC_DUAL);
 }
 
