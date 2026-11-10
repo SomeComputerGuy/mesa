@@ -109,6 +109,12 @@ panfrost_ioctl_get_param(int fd, unsigned long request, void *arg)
       /* default for most hardware so far */
       gp->value = 0x00280030;
       return 0;
+   case DRM_PANFROST_PARAM_SAME_VA_START:
+      gp->value = 1ull << 32;
+      return 0;
+   case DRM_PANFROST_PARAM_SAME_VA_END:
+      gp->value = 1ull << 33;
+      return 0;
    case DRM_PANFROST_PARAM_MAX_THREADS:
    case DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ:
    case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
@@ -132,7 +138,8 @@ panfrost_ioctl_create_bo(int fd, unsigned long request, void *arg)
    drm_shim_bo_init(bo, size);
 
    create->handle = drm_shim_bo_get_handle(shim_fd, bo);
-   create->offset = bo->mem_addr;
+   /* SAME_VA BOs get their GPU address with the mmap(). */
+   create->offset = create->flags & PANFROST_BO_SAME_VA ? 0 : bo->mem_addr;
 
    drm_shim_bo_put(bo);
 
