@@ -295,6 +295,18 @@ public:
       }
    }
 
+   void parseTypePipe(const spv_parsed_instruction_t *ins)
+   {
+      uint32_t typeId = ins->words[ins->operands[0].offset];
+
+      for (auto &kernel : kernels) {
+         for (auto &arg : kernel.args) {
+            if (arg.typeId == typeId)
+               arg.typeQualifier |= CLC_KERNEL_ARG_TYPE_PIPE;
+         }
+      }
+   }
+
    void parseOpString(const spv_parsed_instruction_t *ins)
    {
       const spv_parsed_operand_t *op;
@@ -642,6 +654,9 @@ public:
       case SpvOpTypePointer:
          parser->parseTypePointer(ins);
          break;
+      case SpvOpTypePipe:
+         parser->parseTypePipe(ins);
+         break;
       case SpvOpTypeImage:
          parser->parseOpTypeImage(ins);
          break;
@@ -977,6 +992,9 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
    }
    if (args->features.atomic_scope_all_devices) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_atomic_scope_all_devices");
+   }
+   if (args->features.pipes) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_pipes");
    }
    if (args->features.program_scope_global_variables) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_program_scope_global_variables");

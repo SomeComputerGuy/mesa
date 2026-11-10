@@ -105,6 +105,7 @@ static const struct spirv_capabilities implemented_capabilities = {
    .GroupNonUniformShuffleRelative = true,
    .GroupNonUniformVote = true,
    .Groups = true,
+   .Pipes = true,
    .GroupUniformArithmeticKHR = true,
    .Image1D = true,
    .ImageBasic = true,
@@ -2503,10 +2504,20 @@ vtn_handle_type(struct vtn_builder *b, SpvOp opcode,
       break;
    }
 
-   case SpvOpTypeDeviceEvent:
-   case SpvOpTypeReserveId:
-   case SpvOpTypeQueue:
    case SpvOpTypePipe:
+      /* OpenCL pipe: the global address of the pipe buffer (vtn_handle_pipe) */
+      val->type->base_type = vtn_base_type_scalar;
+      val->type->type = glsl_uint64_t_type();
+      break;
+
+   case SpvOpTypeReserveId:
+      /* first packet index | valid << 32 (nir_intrinsic_pipe_reserve_*) */
+      val->type->base_type = vtn_base_type_scalar;
+      val->type->type = glsl_uint64_t_type();
+      break;
+
+   case SpvOpTypeDeviceEvent:
+   case SpvOpTypeQueue:
    default:
       vtn_fail_with_opcode("Unhandled opcode", opcode);
    }
@@ -7428,6 +7439,24 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpGroupAsyncCopy:
    case SpvOpGroupWaitEvents:
       vtn_handle_opencl_core_instruction(b, opcode, w, count);
+      break;
+
+   case SpvOpReadPipe:
+   case SpvOpWritePipe:
+   case SpvOpReservedReadPipe:
+   case SpvOpReservedWritePipe:
+   case SpvOpReserveReadPipePackets:
+   case SpvOpReserveWritePipePackets:
+   case SpvOpCommitReadPipe:
+   case SpvOpCommitWritePipe:
+   case SpvOpIsValidReserveId:
+   case SpvOpGetNumPipePackets:
+   case SpvOpGetMaxPipePackets:
+   case SpvOpGroupReserveReadPipePackets:
+   case SpvOpGroupReserveWritePipePackets:
+   case SpvOpGroupCommitReadPipe:
+   case SpvOpGroupCommitWritePipe:
+      vtn_handle_pipe(b, opcode, w, count);
       break;
 
    case SpvOpWritePackedPrimitiveIndices4x8NV:

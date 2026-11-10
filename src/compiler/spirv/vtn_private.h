@@ -993,6 +993,8 @@ bool vtn_handle_glsl450_instruction(struct vtn_builder *b, SpvOp ext_opcode,
 
 bool vtn_handle_opencl_instruction(struct vtn_builder *b, SpvOp ext_opcode,
                                    const uint32_t *words, unsigned count);
+void vtn_handle_pipe(struct vtn_builder *b, SpvOp opcode,
+                     const uint32_t *w, unsigned count);
 bool vtn_handle_opencl_core_instruction(struct vtn_builder *b, SpvOp opcode,
                                         const uint32_t *w, unsigned count);
 

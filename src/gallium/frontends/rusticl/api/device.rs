@@ -203,7 +203,7 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             CL_DEVICE_MAX_ON_DEVICE_EVENTS => v.write::<cl_uint>(0),
             CL_DEVICE_MAX_ON_DEVICE_QUEUES => v.write::<cl_uint>(0),
             CL_DEVICE_MAX_PARAMETER_SIZE => v.write::<usize>(dev.param_max_size()),
-            CL_DEVICE_MAX_PIPE_ARGS => v.write::<cl_uint>(0),
+            CL_DEVICE_MAX_PIPE_ARGS => v.write::<cl_uint>(if dev.pipes_supported() { 16 } else { 0 }),
             CL_DEVICE_MAX_READ_IMAGE_ARGS => v.write::<cl_uint>(dev.caps.max_read_images),
             CL_DEVICE_MAX_READ_WRITE_IMAGE_ARGS => v.write::<cl_uint>(if dev.caps.has_rw_images {
                 dev.caps.max_write_images
@@ -253,9 +253,13 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             CL_DEVICE_PCI_BUS_INFO_KHR => {
                 v.write::<cl_device_pci_bus_info_khr>(dev.pci_info().ok_or(CL_INVALID_VALUE)?)
             }
-            CL_DEVICE_PIPE_MAX_ACTIVE_RESERVATIONS => v.write::<cl_uint>(0),
-            CL_DEVICE_PIPE_MAX_PACKET_SIZE => v.write::<cl_uint>(0),
-            CL_DEVICE_PIPE_SUPPORT => v.write::<bool>(false),
+            CL_DEVICE_PIPE_MAX_ACTIVE_RESERVATIONS => {
+                v.write::<cl_uint>(dev.pipes_supported().into())
+            }
+            CL_DEVICE_PIPE_MAX_PACKET_SIZE => {
+                v.write::<cl_uint>(if dev.pipes_supported() { 1024 } else { 0 })
+            }
+            CL_DEVICE_PIPE_SUPPORT => v.write::<bool>(dev.pipes_supported()),
             CL_DEVICE_PLATFORM => v.write::<cl_platform_id>(Platform::get().as_ptr()),
             CL_DEVICE_PREFERRED_GLOBAL_ATOMIC_ALIGNMENT => v.write::<cl_uint>(0),
             CL_DEVICE_PREFERRED_INTEROP_USER_SYNC => v.write::<bool>(true),

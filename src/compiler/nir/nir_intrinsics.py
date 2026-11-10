@@ -660,6 +660,13 @@ intrinsic("workgroup_exclusive_scan", src_comp=[1], dest_comp=1, bit_sizes=src0,
           indices=[REDUCTION_OP])
 intrinsic("workgroup_broadcast", src_comp=[1, 3], dest_comp=1, bit_sizes=src0)
 
+# OpenCL pipes (the frontend lowers these): reserve src[1] packets of the pipe at
+# global address src[0] for reading or writing, by every invocation or once per
+# work-group (EXECUTION_SCOPE). The result packs the first packet index (low
+# 32 bits) and a valid flag (high 32 bits).
+intrinsic("pipe_reserve_read", src_comp=[1, 1], dest_comp=1, indices=[EXECUTION_SCOPE], bit_sizes=[64])
+intrinsic("pipe_reserve_write", src_comp=[1, 1], dest_comp=1, indices=[EXECUTION_SCOPE], bit_sizes=[64])
+
 # AMD shader ballot operations
 intrinsic("quad_swizzle_amd", src_comp=[0], dest_comp=0, bit_sizes=src0,
           indices=[SWIZZLE_MASK, FETCH_INACTIVE],

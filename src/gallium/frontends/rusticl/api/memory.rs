@@ -2503,9 +2503,17 @@ fn enqueue_migrate_mem_objects(
 
 #[cl_info_entrypoint(clGetPipeInfo)]
 unsafe impl CLInfo<cl_pipe_info> for cl_mem {
-    fn query(&self, _q: cl_pipe_info, _v: CLInfoValue) -> CLResult<CLInfoRes> {
+    fn query(&self, q: cl_pipe_info, v: CLInfoValue) -> CLResult<CLInfoRes> {
         // CL_INVALID_MEM_OBJECT if pipe is a not a valid pipe object.
-        Err(CL_INVALID_MEM_OBJECT)
+        let [packet_size, max_packets] = Buffer::ref_from_raw(*self)?
+            .pipe
+            .ok_or(CL_INVALID_MEM_OBJECT)?;
+        match q.0 {
+            CL_PIPE_PACKET_SIZE => v.write::<cl_uint>(packet_size),
+            CL_PIPE_MAX_PACKETS => v.write::<cl_uint>(max_packets),
+            CL_PIPE_PROPERTIES => v.write::<&[cl_pipe_properties]>(&[]),
+            _ => Err(CL_INVALID_VALUE),
+        }
     }
 }
 
@@ -3166,13 +3174,43 @@ fn enqueue_svm_migrate_mem(
 
 #[cl_entrypoint(clCreatePipe)]
 fn create_pipe(
-    _context: cl_context,
-    _flags: cl_mem_flags,
-    _pipe_packet_size: cl_uint,
-    _pipe_max_packets: cl_uint,
-    _properties: *const cl_pipe_properties,
+    context: cl_context,
+    flags: cl_mem_flags,
+    pipe_packet_size: cl_uint,
+    pipe_max_packets: cl_uint,
+    properties: *const cl_pipe_properties,
 ) -> CLResult<cl_mem> {
-    Err(CL_INVALID_OPERATION)
+    let c = Context::arc_from_raw(context)?;
+
+    // CL_INVALID_OPERATION if no devices in context support pipes.
+    if !c.devs.iter().any(|d| d.pipes_supported()) {
+        return Err(CL_INVALID_OPERATION);
+    }
+
+    // CL_INVALID_VALUE if values specified in flags are not as defined above (0 means
+    // CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS).
+    let flags = if flags == 0 {
+        (CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS) as cl_mem_flags
+    } else {
+        flags
+    };
+    if flags & !(CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS) as cl_mem_flags != 0 {
+        return Err(CL_INVALID_VALUE);
+    }
+
+    // CL_INVALID_VALUE if properties is not NULL (no properties are defined).
+    // SAFETY: properties is NULL or points to a list terminated by 0.
+    if !properties.is_null() && unsafe { *properties } != 0 {
+        return Err(CL_INVALID_VALUE);
+    }
+
+    // CL_INVALID_PIPE_SIZE if pipe_packet_size is 0 or larger than CL_DEVICE_PIPE_MAX_PACKET_SIZE
+    // of all devices in context, or if pipe_max_packets is 0.
+    if pipe_packet_size == 0 || pipe_packet_size > 1024 || pipe_max_packets == 0 {
+        return Err(CL_INVALID_PIPE_SIZE);
+    }
+
+    Ok(MemBase::new_pipe(c, flags, pipe_packet_size, pipe_max_packets)?.into_cl())
 }
 
 #[cl_info_entrypoint(clGetGLTextureInfo)]
