@@ -65,6 +65,14 @@ void GENX(jm_emit_fragment_job)(struct panfrost_batch *batch,
 void GENX(jm_launch_xfb)(struct panfrost_batch *batch,
                          const struct pipe_draw_info *info, unsigned count);
 
+struct panfrost_poly_compute {
+   uint64_t rsd, attribs, attrib_bufs, ubos, push, textures, samplers;
+   unsigned grid[3], block[3];
+};
+
+void GENX(jm_launch_poly_compute)(struct panfrost_batch *batch,
+                                  const struct panfrost_poly_compute *c);
+
 void GENX(jm_launch_grid)(struct panfrost_batch *batch,
                           const struct pipe_grid_info *info);
 

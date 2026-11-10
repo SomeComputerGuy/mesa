@@ -100,6 +100,18 @@ sysval_for_intrinsic(unsigned arch, nir_intrinsic_instr *intr, unsigned *offset)
    case nir_intrinsic_load_printf_buffer_address:
       return PAN_SYSVAL_PRINTF_BUFFER;
 
+   case nir_intrinsic_load_vertex_param_buffer_poly:
+      return PAN_SYSVAL(POLY, PAN_SYSVAL_POLY_VERTEX_PARAMS);
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      return PAN_SYSVAL(POLY, PAN_SYSVAL_POLY_GEOMETRY_PARAMS);
+   case nir_intrinsic_load_tess_param_buffer_poly:
+      return PAN_SYSVAL(POLY, PAN_SYSVAL_POLY_TESS_PARAMS);
+   case nir_intrinsic_load_ro_sink_address_poly:
+   case nir_intrinsic_load_stat_query_address_poly:
+      return PAN_SYSVAL(POLY, PAN_SYSVAL_POLY_SINK);
+   case nir_intrinsic_load_provoking_last:
+      return PAN_SYSVAL(POLY, PAN_SYSVAL_POLY_PROVOKING_LAST);
+
    case nir_intrinsic_load_blend_const_color_rgba:
       return PAN_SYSVAL_BLEND_CONSTANTS;
 

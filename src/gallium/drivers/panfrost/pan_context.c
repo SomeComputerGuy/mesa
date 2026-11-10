@@ -442,6 +442,25 @@ panfrost_bind_depth_stencil_state(struct pipe_context *pipe, void *cso)
 }
 
 static void
+panfrost_set_patch_vertices(struct pipe_context *pipe, uint8_t patch_vertices)
+{
+   pan_context(pipe)->patch_vertices = patch_vertices;
+}
+
+static void
+panfrost_set_tess_state(struct pipe_context *pipe,
+                        const float default_outer_level[4],
+                        const float default_inner_level[2])
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+
+   memcpy(ctx->default_outer_level, default_outer_level,
+          sizeof(ctx->default_outer_level));
+   memcpy(ctx->default_inner_level, default_inner_level,
+          sizeof(ctx->default_inner_level));
+}
+
+static void
 panfrost_set_sample_mask(struct pipe_context *pipe, unsigned sample_mask)
 {
    struct panfrost_context *ctx = pan_context(pipe);
@@ -1125,6 +1144,8 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    gallium->delete_depth_stencil_alpha_state = panfrost_generic_cso_delete;
 
    gallium->set_sample_mask = panfrost_set_sample_mask;
+   gallium->set_patch_vertices = panfrost_set_patch_vertices;
+   gallium->set_tess_state = panfrost_set_tess_state;
    gallium->set_min_samples = panfrost_set_min_samples;
 
    gallium->set_viewport_states = panfrost_set_viewport_states;
