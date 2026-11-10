@@ -3426,6 +3426,15 @@ vtn_translate_scope(struct vtn_builder *b, SpvScope scope)
    case SpvScopeShaderCallKHR:
       return SCOPE_SHADER_CALL;
 
+   case SpvScopeCrossDevice:
+      /* OpenCL memory_scope_all_svm_devices / all_devices: one device, the
+       * host only sees SVM memory at synchronization points (no fine-grain
+       * SVM atomics), so device scope covers it.
+       */
+      vtn_fail_if(b->options->environment != NIR_SPIRV_OPENCL,
+                  "CrossDevice scope is only valid in OpenCL kernels");
+      return SCOPE_DEVICE;
+
    default:
       vtn_fail("Invalid memory scope");
    }
