@@ -701,6 +701,11 @@ impl DeviceBase {
 
         add_feat(1, 0, 0, "__opencl_c_program_scope_global_variables");
 
+        if self.pipes_supported() {
+            add_cap(SpvCapability::SpvCapabilityPipes);
+            add_feat(1, 0, 0, "__opencl_c_pipes");
+        }
+
         if self.wg_collectives_supported() {
             add_cap(SpvCapability::SpvCapabilityGroups);
             add_feat(1, 0, 0, "__opencl_c_work_group_collective_functions");
@@ -905,6 +910,11 @@ impl DeviceBase {
     /// Arm blob reports (and the OpenCL minimum).
     pub fn max_global_variable_size(&self) -> usize {
         64 * 1024
+    }
+
+    /// OpenCL 2.0 pipes (vtn_handle_pipe, rusticl_lower_pipes)
+    pub fn pipes_supported(&self) -> bool {
+        true
     }
 
     pub fn wg_collectives_supported(&self) -> bool {
@@ -1427,6 +1437,7 @@ impl DeviceBase {
             atomic_scope_all_devices: true,
             extended_bit_ops: true,
             program_scope_global_variables: true,
+            pipes: self.pipes_supported(),
             fp16: self.fp16_supported(),
             fp64: self.fp64_supported(),
             generic_address_space: self.generic_address_space_supported(),

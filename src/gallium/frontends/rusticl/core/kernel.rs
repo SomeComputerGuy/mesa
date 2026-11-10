@@ -170,6 +170,13 @@ impl KernelArg {
         for (i, s) in spirv.iter().enumerate() {
             let nir = nir_arg_map.get(&(i as i32)).unwrap();
             let kind = match s.address_qualifier {
+                clc_kernel_arg_address_qualifier::CLC_KERNEL_ARG_ADDRESS_PRIVATE
+                    if s.type_qualifier & clc_kernel_arg_type_qualifier::CLC_KERNEL_ARG_TYPE_PIPE
+                        != clc_kernel_arg_type_qualifier(0) =>
+                {
+                    // a pipe is passed as the address of its buffer
+                    KernelArgType::MemGlobal
+                }
                 clc_kernel_arg_address_qualifier::CLC_KERNEL_ARG_ADDRESS_PRIVATE => {
                     if unsafe { glsl_type_is_sampler(nir.type_) } {
                         KernelArgType::Sampler
@@ -783,6 +790,9 @@ fn compile_nir_to_args(
             rusticl_lower_wg_collectives,
             dev.max_threads_per_block() as u32
         );
+    }
+    if dev.pipes_supported() {
+        nir_pass!(nir, rusticl_lower_pipes);
     }
 
     let printf_opts = nir_lower_printf_options {
@@ -2317,6 +2327,10 @@ impl Kernel {
 
         if tq & clc_kernel_arg_type_qualifier::CLC_KERNEL_ARG_TYPE_VOLATILE != zero {
             res |= CL_KERNEL_ARG_TYPE_VOLATILE;
+        }
+
+        if tq & clc_kernel_arg_type_qualifier::CLC_KERNEL_ARG_TYPE_PIPE != zero {
+            res |= CL_KERNEL_ARG_TYPE_PIPE;
         }
 
         res.into()

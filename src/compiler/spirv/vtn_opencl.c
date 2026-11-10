@@ -1324,3 +1324,152 @@ vtn_handle_opencl_core_instruction(struct vtn_builder *b, SpvOp opcode,
    }
    return true;
 }
+
+/* OpenCL 2.0 pipes. A pipe is the global address of a buffer:
+ *
+ *   uint32 write_index, read_index, max_packets, packet_size;
+ *   packet ring[max_packets];
+ *   packet spare;    (target of failed writes)
+ *
+ * The indices only grow; packet i lives at ring[i % max_packets]. A kernel
+ * only reads or only writes a given pipe, and kernels on a queue do not
+ * overlap here, so reserving is a compare-and-swap on one index against the
+ * other one (nir_intrinsic_pipe_reserve_*, lowered by the frontend after
+ * structurizing) and commits have nothing to do. Copying packets needs no
+ * control flow: a failed write goes to the spare packet, a failed read keeps
+ * the old contents of the destination.
+ */
+#define VTN_PIPE_HEADER 16
+
+static nir_def *
+vtn_pipe_load_u32(nir_builder *b, nir_def *pipe, unsigned offset)
+{
+   return nir_load_global(b, 1, 32, nir_iadd_imm(b, pipe, offset),
+                          .align_mul = 4,
+                          .access = ACCESS_COHERENT | ACCESS_VOLATILE);
+}
+
+static void
+vtn_pipe_copy(struct vtn_builder *b, nir_def *pipe, nir_def *index,
+              nir_def *ok, uint32_t ptr_id, unsigned size, unsigned align,
+              bool write)
+{
+   nir_builder *nb = &b->nb;
+   nir_def *max = vtn_pipe_load_u32(nb, pipe, 8);
+   nir_def *slot = nir_imul_imm(nb, nir_umod(nb, index, max), size);
+   if (write)
+      slot = nir_bcsel(nb, ok, slot, nir_imul_imm(nb, max, size));
+   nir_def *addr = nir_iadd(nb, nir_iadd_imm(nb, pipe, VTN_PIPE_HEADER),
+                            nir_u2u64(nb, slot));
+
+   unsigned chunk = 4;
+   while (chunk > 1 && (size % chunk || align % chunk))
+      chunk /= 2;
+   const struct glsl_type *type = glsl_uintN_t_type(chunk * 8);
+
+   struct vtn_pointer *ptr = vtn_value(b, ptr_id, vtn_value_type_pointer)->pointer;
+   nir_deref_instr *user = vtn_pointer_to_deref(b, ptr);
+   nir_deref_instr *user_cast =
+      nir_build_deref_cast_with_alignment(nb, &user->def, user->modes, type,
+                                          chunk, chunk, 0);
+   nir_deref_instr *ring_cast =
+      nir_build_deref_cast_with_alignment(nb, addr, nir_var_mem_global, type,
+                                          chunk, chunk, 0);
+
+   for (unsigned i = 0; i < size / chunk; i++) {
+      nir_deref_instr *u = nir_build_deref_ptr_as_array(nb, user_cast, nir_imm_int64(nb, i));
+      nir_deref_instr *r = nir_build_deref_ptr_as_array(nb, ring_cast, nir_imm_int64(nb, i));
+      if (write) {
+         nir_store_deref(nb, r, nir_load_deref(nb, u), 1);
+      } else {
+         nir_def *v = nir_load_deref(nb, r);
+         nir_store_deref(nb, u, nir_bcsel(nb, ok, v, nir_load_deref(nb, u)), 1);
+      }
+   }
+}
+
+static nir_def *
+vtn_pipe_reserve(struct vtn_builder *b, nir_def *pipe, nir_def *num,
+                 mesa_scope scope, bool write)
+{
+   nir_builder *nb = &b->nb;
+   num = nir_u2u32(nb, num);
+   return write ? nir_pipe_reserve_write(nb, pipe, num, .execution_scope = scope)
+                : nir_pipe_reserve_read(nb, pipe, num, .execution_scope = scope);
+}
+
+void
+vtn_handle_pipe(struct vtn_builder *b, SpvOp opcode,
+                const uint32_t *w, unsigned count)
+{
+   nir_builder *nb = &b->nb;
+   nir_def *res = NULL;
+
+   switch (opcode) {
+   case SpvOpReadPipe:
+   case SpvOpWritePipe: {
+      const bool write = opcode == SpvOpWritePipe;
+      nir_def *pipe = vtn_get_nir_ssa(b, w[3]);
+      nir_def *r = vtn_pipe_reserve(b, pipe, nir_imm_int(nb, 1), SCOPE_INVOCATION, write);
+      nir_def *ok = nir_ine_imm(nb, nir_unpack_64_2x32_split_y(nb, r), 0);
+      vtn_pipe_copy(b, pipe, nir_unpack_64_2x32_split_x(nb, r), ok, w[4],
+                    vtn_constant_uint(b, w[5]), vtn_constant_uint(b, w[6]), write);
+      res = nir_bcsel(nb, ok, nir_imm_int(nb, 0), nir_imm_int(nb, -1));
+      break;
+   }
+
+   case SpvOpReservedReadPipe:
+   case SpvOpReservedWritePipe: {
+      const bool write = opcode == SpvOpReservedWritePipe;
+      nir_def *pipe = vtn_get_nir_ssa(b, w[3]);
+      nir_def *r = vtn_get_nir_ssa(b, w[4]);
+      nir_def *ok = nir_ine_imm(nb, nir_unpack_64_2x32_split_y(nb, r), 0);
+      nir_def *index = nir_iadd(nb, nir_unpack_64_2x32_split_x(nb, r),
+                                nir_u2u32(nb, vtn_get_nir_ssa(b, w[5])));
+      vtn_pipe_copy(b, pipe, index, ok, w[6],
+                    vtn_constant_uint(b, w[7]), vtn_constant_uint(b, w[8]), write);
+      res = nir_bcsel(nb, ok, nir_imm_int(nb, 0), nir_imm_int(nb, -1));
+      break;
+   }
+
+   case SpvOpReserveReadPipePackets:
+   case SpvOpReserveWritePipePackets:
+      res = vtn_pipe_reserve(b, vtn_get_nir_ssa(b, w[3]), vtn_get_nir_ssa(b, w[4]),
+                             SCOPE_INVOCATION, opcode == SpvOpReserveWritePipePackets);
+      break;
+
+   case SpvOpGroupReserveReadPipePackets:
+   case SpvOpGroupReserveWritePipePackets:
+      vtn_fail_if(vtn_constant_uint(b, w[3]) != SpvScopeWorkgroup,
+                  "only work-group scope pipe reservations are supported");
+      res = vtn_pipe_reserve(b, vtn_get_nir_ssa(b, w[4]), vtn_get_nir_ssa(b, w[5]),
+                             SCOPE_WORKGROUP, opcode == SpvOpGroupReserveWritePipePackets);
+      break;
+
+   case SpvOpCommitReadPipe:
+   case SpvOpCommitWritePipe:
+   case SpvOpGroupCommitReadPipe:
+   case SpvOpGroupCommitWritePipe:
+      /* packets are visible to the next kernel anyway */
+      return;
+
+   case SpvOpIsValidReserveId:
+      res = nir_ine_imm(nb, nir_unpack_64_2x32_split_y(nb, vtn_get_nir_ssa(b, w[3])), 0);
+      break;
+
+   case SpvOpGetNumPipePackets: {
+      nir_def *pipe = vtn_get_nir_ssa(b, w[3]);
+      res = nir_isub(nb, vtn_pipe_load_u32(nb, pipe, 0), vtn_pipe_load_u32(nb, pipe, 4));
+      break;
+   }
+
+   case SpvOpGetMaxPipePackets:
+      res = vtn_pipe_load_u32(nb, vtn_get_nir_ssa(b, w[3]), 8);
+      break;
+
+   default:
+      UNREACHABLE("not a pipe instruction");
+   }
+
+   vtn_push_nir_ssa(b, w[2], res);
+}

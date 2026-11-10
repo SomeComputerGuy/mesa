@@ -640,6 +640,77 @@ rusticl_lower_wg_collectives(nir_shader *nir, unsigned max_invocations)
    return nir_shader_intrinsics_pass(nir, lower_wg_collective, nir_metadata_none, &state);
 }
 
+/* OpenCL pipes (see vtn_handle_pipe for the layout): a reservation is a
+ * compare-and-swap loop on the own index of the kernel (write or read index)
+ * against the other index, once per work-group for the work_group_ variants
+ * (invocation 0, then a shared slot).
+ */
+static nir_def *
+pipe_reserve(nir_builder *b, nir_def *pipe, nir_def *num, bool write)
+{
+   const enum gl_access_qualifier access = ACCESS_COHERENT | ACCESS_VOLATILE;
+   nir_def *own = nir_iadd_imm(b, pipe, write ? 0 : 4);
+   nir_def *other = nir_iadd_imm(b, pipe, write ? 4 : 0);
+   nir_def *max = nir_load_global(b, 1, 32, nir_iadd_imm(b, pipe, 8),
+                                  .align_mul = 4, .access = access);
+
+   nir_variable *res = nir_local_variable_create(b->impl, glsl_uint64_t_type(), "pipe_rid");
+   nir_store_var(b, res, nir_imm_int64(b, 0), 1);
+   nir_push_loop(b);
+   {
+      nir_def *cur = nir_load_global(b, 1, 32, own, .align_mul = 4, .access = access);
+      nir_def *oth = nir_load_global(b, 1, 32, other, .align_mul = 4, .access = access);
+      nir_def *avail = write ? nir_isub(b, max, nir_isub(b, cur, oth)) : nir_isub(b, oth, cur);
+      nir_break_if(b, nir_ior(b, nir_ieq_imm(b, num, 0), nir_ult(b, avail, num)));
+      nir_def *old = nir_global_atomic_swap(b, 32, own, cur, nir_iadd(b, cur, num),
+                                            .atomic_op = nir_atomic_op_cmpxchg);
+      nir_push_if(b, nir_ieq(b, old, cur));
+      {
+         nir_store_var(b, res, nir_pack_64_2x32_split(b, cur, nir_imm_int(b, 1)), 1);
+         nir_jump(b, nir_jump_break);
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_loop(b, NULL);
+   return nir_load_var(b, res);
+}
+
+static bool
+lower_pipe(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_pipe_reserve_read &&
+       intr->intrinsic != nir_intrinsic_pipe_reserve_write)
+      return false;
+
+   const bool write = intr->intrinsic == nir_intrinsic_pipe_reserve_write;
+   nir_def *pipe = intr->src[0].ssa, *num = intr->src[1].ssa;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *res;
+
+   if (nir_intrinsic_execution_scope(intr) == SCOPE_WORKGROUP) {
+      nir_variable *slot = nir_variable_create(b->shader, nir_var_mem_shared,
+                                               glsl_uint64_t_type(), "pipe_wg_rid");
+      nir_def *lid = wg_linear(b, nir_load_local_invocation_id(b), nir_load_workgroup_size(b));
+      wg_barrier(b);
+      nir_push_if(b, nir_ieq_imm(b, lid, 0));
+      nir_store_var(b, slot, pipe_reserve(b, pipe, num, write), 1);
+      nir_pop_if(b, NULL);
+      wg_barrier(b);
+      res = nir_load_var(b, slot);
+   } else {
+      res = pipe_reserve(b, pipe, num, write);
+   }
+
+   nir_def_replace(&intr->def, res);
+   return true;
+}
+
+bool
+rusticl_lower_pipes(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, lower_pipe, nir_metadata_none, NULL);
+}
+
 /* Non-uniform work-groups: the last work-groups of a dimension that the
  * work-group size does not divide run as their own dispatches with the
  * remainder as block size and the work-group offset of their position (the Arm

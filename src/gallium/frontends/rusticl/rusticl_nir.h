@@ -32,3 +32,4 @@ bool rusticl_lower_wg_collectives(nir_shader *nir, unsigned max_invocations);
 bool rusticl_lower_non_uniform_ids(nir_shader *nir);
 bool rusticl_gather_global_initializers(nir_shader *nir, void *dst);
 bool rusticl_has_global_pointer_initializers(nir_shader *nir);
+bool rusticl_lower_pipes(nir_shader *nir);

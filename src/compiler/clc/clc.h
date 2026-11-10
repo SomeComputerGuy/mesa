@@ -74,6 +74,7 @@ struct clc_optional_features {
    bool intel_subgroups;
    bool kernel_clock;
    bool program_scope_global_variables;
+   bool pipes;
    /* OpenCL core subgroups */
    bool subgroups;
    /* OpenCL extension cl_khr_subgroups, which requires independent forward
@@ -145,6 +146,7 @@ enum clc_kernel_arg_type_qualifier {
    CLC_KERNEL_ARG_TYPE_CONST = 1 << 0,
    CLC_KERNEL_ARG_TYPE_RESTRICT = 1 << 1,
    CLC_KERNEL_ARG_TYPE_VOLATILE = 1 << 2,
+   CLC_KERNEL_ARG_TYPE_PIPE = 1 << 3,
 };
 
 enum clc_kernel_arg_access_qualifier {

@@ -637,6 +637,8 @@ pub struct MemBase {
 
 pub struct Buffer {
     base: MemBase,
+    /// a pipe (CL_MEM_OBJECT_PIPE): packet size and maximum number of packets
+    pub pipe: Option<[cl_uint; 2]>,
     address: Option<HashMap<&'static Device, NonZeroU64>>,
     maps: Mutex<TrackedPointers<usize, Mapping<BufferMapping>>>,
 }
@@ -902,6 +904,7 @@ impl MemBase {
                 cbs: Mutex::new(Vec::new()),
                 alloc: alloc,
             },
+            pipe: None,
             address: addresses,
             maps: Mutex::new(TrackedPointers::new()),
         });
@@ -911,6 +914,37 @@ impl MemBase {
         }
 
         Ok(buffer)
+    }
+
+    /// An OpenCL pipe: a buffer with the layout of vtn_handle_pipe (16 byte header: write index,
+    /// read index, maximum packets, packet size; the packets; one spare packet)
+    pub fn new_pipe(
+        context: Arc<Context>,
+        flags: cl_mem_flags,
+        packet_size: cl_uint,
+        max_packets: cl_uint,
+    ) -> CLResult<Arc<Buffer>> {
+        let size = (max_packets as usize + 1)
+            .checked_mul(packet_size as usize)
+            .and_then(|s| s.checked_add(16))
+            .ok_or(CL_INVALID_PIPE_SIZE)?;
+        let mut init = vec![0u8; size];
+        init[8..12].copy_from_slice(&max_packets.to_ne_bytes());
+        init[12..16].copy_from_slice(&packet_size.to_ne_bytes());
+
+        let buffer = Self::new_buffer(
+            context,
+            flags | CL_MEM_COPY_HOST_PTR as cl_mem_flags,
+            size,
+            init.as_mut_ptr().cast(),
+            Properties::default(),
+        )?;
+        // nobody else has the new buffer yet (no device address was asked for)
+        let mut buffer = Arc::try_unwrap(buffer).map_err(|_| CL_OUT_OF_HOST_MEMORY)?;
+        buffer.base.mem_type = CL_MEM_OBJECT_PIPE;
+        buffer.base.flags = flags;
+        buffer.pipe = Some([packet_size, max_packets]);
+        Ok(Arc::new(buffer))
     }
 
     pub fn new_sub_buffer(
@@ -939,6 +973,7 @@ impl MemBase {
                 cbs: Mutex::new(Vec::new()),
                 alloc: Allocation::new_sub(Mem::Buffer(parent), offset),
             },
+            pipe: None,
             address: address,
             maps: Mutex::new(TrackedPointers::new()),
         })
@@ -1127,6 +1162,7 @@ impl MemBase {
         Ok(if rusticl_type == RusticlTypes::Buffer {
             Arc::new(Buffer {
                 base: base,
+                pipe: None,
                 address: None,
                 maps: Mutex::new(TrackedPointers::new()),
             })
