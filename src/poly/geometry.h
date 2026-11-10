@@ -185,16 +185,28 @@ struct poly_vertex_params {
     */
    uint32_t grid[6];
 
-   uint32_t _pad;
+   /* If nonzero, the vertex shader ran with hardware vertex IDs over the
+    * index range [index_min, index_max] of an indexed draw instead of once
+    * per index (software input assembly). Its outputs are then stored per
+    * unique vertex, verts_per_instance vertices per instance, and the
+    * per-vertex inputs of a later stage are found by looking up the index of
+    * each draw-order vertex in index_buffer.
+    */
+   uint32_t hw_indexed;
 
    /* Output buffer for vertex data */
    uint64_t output_buffer;
 
    /* Mask of outputs present in the output buffer */
    uint64_t outputs;
+
+   /* With hw_indexed: the smallest index of the draw. */
+   uint32_t index_min;
+
+   uint32_t _pad;
 } PACKED;
-static_assert(sizeof(struct poly_vertex_params) == 16 * 4,
-              "struct poly_vertex_params must be 16 words");
+static_assert(sizeof(struct poly_vertex_params) == 18 * 4,
+              "struct poly_vertex_params must be 18 words");
 
 static inline void
 poly_vertex_params_init(struct poly_vertex_params *p,

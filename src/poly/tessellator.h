@@ -100,6 +100,12 @@ struct poly_tess_params {
     * dynamically in the TES.
     */
    uint32_t ccw;
+
+   /* If nonzero, per-patch domain point counts (prefix summed after the
+    * COUNT pass): domain points are dense and in patch order, see
+    * poly_tess_count_points.
+    */
+   DEVICE(uint32_t) point_counts;
 } PACKED;
-static_assert(sizeof(struct poly_tess_params) == 34 * 4,
-              "struct poly_tess_params must be 34 words");
+static_assert(sizeof(struct poly_tess_params) == 36 * 4,
+              "struct poly_tess_params must be 36 words");

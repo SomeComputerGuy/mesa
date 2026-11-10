@@ -370,7 +370,8 @@ lower_gs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *_)
 
    nir_def *verts = load_vertex_param(b, grid[0]);
    nir_def *unrolled =
-      nir_iadd(b, nir_imul(b, nir_load_instance_id(b), verts), vertex);
+      poly_vs_output_vertex(b, nir_load_vertex_param_buffer_poly(b),
+                            nir_load_instance_id(b), vertex, verts);
 
    nir_def *val = poly_load_per_vertex_input(b, intr, unrolled);
    nir_def_replace(&intr->def, val);
@@ -717,6 +718,14 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       rs.output_id = nir_umod_imm(b, raw_vertex_id, stride);
       rs.instance_id = nir_ushr(b, unrolled, primitives_log2);
       rs.primitive_id = nir_iand(b, unrolled, nir_iadd_imm(b, bit, -1));
+
+      /* The power-of-two primitive stride leaves IDs past the last primitive
+       * that no index refers to. Hardware that shades the whole index range
+       * runs them anyway: keep their input loads in bounds.
+       */
+      rs.primitive_id =
+         nir_umin(b, rs.primitive_id,
+                  nir_iadd_imm(b, load_geometry_param(b, grid[0]), -1));
       break;
    }
 

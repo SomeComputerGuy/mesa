@@ -167,6 +167,37 @@ poly_draw_points(private struct CHWTessellator *ctx,
    }
 }
 
+/*
+ * Dense domain points (point_counts != 0): the COUNT pass records the number
+ * of domain points of each patch, which is then prefix summed like the index
+ * counts. Patch points are stored back to back in patch order and the TES
+ * vertex IDs are dense: hardware without index-driven vertex shading shades
+ * the whole vertex ID range.
+ */
+static inline void
+poly_tess_count_points(constant struct poly_tess_params *p,
+                       enum poly_tess_mode mode, uint patch, uint count)
+{
+   if (mode == POLY_TESS_MODE_COUNT && p->point_counts)
+      p->point_counts[patch] = count;
+}
+
+static inline uint
+poly_tess_first_point(constant struct poly_tess_params *p, uint patch)
+{
+   /* Inclusive prefix sum */
+   return patch == 0 ? 0 : p->point_counts[patch - 1];
+}
+
+static inline uint
+poly_tess_index_bias(constant struct poly_tess_params *p, uint patch)
+{
+   if (p->point_counts)
+      return poly_tess_first_point(p, patch);
+   else
+      return patch * POLY_TES_PATCH_ID_STRIDE;
+}
+
 static inline void
 poly_draw_empty(constant struct poly_tess_params *p, enum poly_tess_mode mode,
                 uint patch)
@@ -174,6 +205,8 @@ poly_draw_empty(constant struct poly_tess_params *p, enum poly_tess_mode mode,
    if (mode == POLY_TESS_MODE_COUNT) {
       p->counts[patch] = 0;
    }
+
+   poly_tess_count_points(p, mode, patch, 0);
 }
 
 /*
@@ -190,6 +223,12 @@ poly_heap_alloc_points(constant struct poly_tess_params *p, uint patch,
     */
    if (p->statistic) {
       atomic_fetch_add((volatile atomic_uint *)(p->statistic), count);
+   }
+
+   if (p->point_counts) {
+      uint first = poly_tess_first_point(p, patch);
+      p->coord_allocs[patch] = first;
+      return &p->patch_coord_buffer[first];
    }
 
    uint32_t elsize_B = sizeof(struct poly_tess_point);
@@ -774,6 +813,7 @@ poly_tess_isoline_process(constant struct poly_tess_params *p, uint32_t patch,
 
    /* Points */
    uint num_points = numPointsPerLine * numLines;
+   poly_tess_count_points(p, mode, patch, num_points);
    if (mode != POLY_TESS_MODE_COUNT) {
       global struct poly_tess_point *points =
          poly_heap_alloc_points(p, patch, num_points);
@@ -793,7 +833,7 @@ poly_tess_isoline_process(constant struct poly_tess_params *p, uint32_t patch,
 
    struct CHWTessellator ctx = {
       .mode = mode,
-      .index_bias = patch * POLY_TES_PATCH_ID_STRIDE,
+      .index_bias = poly_tess_index_bias(p, patch),
    };
 
    /* Connectivity */
@@ -833,7 +873,7 @@ poly_tess_tri_process(constant struct poly_tess_params *p, uint32_t patch,
 
    struct CHWTessellator ctx = {
       .mode = mode,
-      .index_bias = patch * POLY_TES_PATCH_ID_STRIDE,
+      .index_bias = poly_tess_index_bias(p, patch),
    };
 
    // Is the patch culled? NaN will pass.
@@ -898,6 +938,7 @@ poly_tess_tri_process(constant struct poly_tess_params *p, uint32_t patch,
           (FXP_ONE == outsideTessFactor[Weq0])) {
 
          /* Just do minimum tess factor */
+         poly_tess_count_points(p, mode, patch, 3);
          if (mode == POLY_TESS_MODE_COUNT) {
             p->counts[patch] = 3;
             return;
@@ -964,6 +1005,7 @@ poly_tess_tri_process(constant struct poly_tess_params *p, uint32_t patch,
    }
 
    /* GENERATE POINTS */
+   poly_tess_count_points(p, mode, patch, NumPoints);
    if (mode != POLY_TESS_MODE_COUNT) {
       ctx.Point = poly_heap_alloc_points(p, patch, NumPoints);
 
@@ -1162,7 +1204,7 @@ poly_tess_quad_process(constant struct poly_tess_params *p, uint32_t patch,
 
    struct CHWTessellator ctx = {
       .mode = mode,
-      .index_bias = patch * POLY_TES_PATCH_ID_STRIDE,
+      .index_bias = poly_tess_index_bias(p, patch),
    };
 
    // Is the patch culled?
@@ -1239,6 +1281,7 @@ poly_tess_quad_process(constant struct poly_tess_params *p, uint32_t patch,
           (FXP_ONE == outsideTessFactor[Veq1])) {
 
          /* Just do minimum tess factor */
+         poly_tess_count_points(p, mode, patch, 4);
          if (!p->points_mode) {
             ctx.Index = poly_draw(p, mode, false, patch, 6);
             if (mode == POLY_TESS_MODE_COUNT)
@@ -1301,6 +1344,7 @@ poly_tess_quad_process(constant struct poly_tess_params *p, uint32_t patch,
                            (numPointsForInsideTessFactor[V] - 2);
    NumPoints += numInteriorPoints;
 
+   poly_tess_count_points(p, mode, patch, NumPoints);
    if (mode != POLY_TESS_MODE_COUNT) {
       ctx.Point = poly_heap_alloc_points(p, patch, NumPoints);
 
