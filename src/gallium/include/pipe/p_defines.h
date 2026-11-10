@@ -1215,6 +1215,9 @@ struct pipe_caps {
    /** for CL SVM */
    uint64_t min_vma;
    uint64_t max_vma;
+   /** resource_assign_vma() maps the resource's storage at that CPU address
+    * too, so the frontend's host pointer and the resource share memory. */
+   bool vm_cpu_shared;
 
    /** Which POT pattern sizes are accelerated? This is a bitmask of sizes */
    uint16_t hw_clear_buffer_sizes;

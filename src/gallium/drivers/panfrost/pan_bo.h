@@ -38,6 +38,11 @@
  * PAN_BO_SHARED if the BO has not been exported yet */
 #define PAN_BO_SHAREABLE (1 << 5)
 
+/* BO has no GPU address until panfrost_bo_bind_same_va() maps it on the CPU
+ * at a fixed address, which then is its GPU address too (OpenCL SVM). Never
+ * cached, never replaced by another BO. */
+#define PAN_BO_SAME_VA (1 << 6)
+
 struct panfrost_device;
 
 struct panfrost_bo {
@@ -114,6 +119,7 @@ void panfrost_bo_unreference(struct panfrost_bo *bo);
 struct panfrost_bo *panfrost_bo_create(struct panfrost_device *dev, size_t size,
                                        uint32_t flags, const char *label);
 int panfrost_bo_mmap(struct panfrost_bo *bo);
+int panfrost_bo_bind_same_va(struct panfrost_bo *bo, uint64_t address);
 struct panfrost_bo *panfrost_bo_import(struct panfrost_device *dev, int fd);
 int panfrost_bo_export(struct panfrost_bo *bo);
 void panfrost_bo_cache_evict_all(struct panfrost_device *dev);

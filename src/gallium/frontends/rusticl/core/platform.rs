@@ -206,17 +206,24 @@ impl Platform {
         // Allocate 1/8 of the available VM. No specific reason for this limit. Might have to bump
         // this later, but it's probably fine as there is plenty of VM available.
         let size = NonZeroU64::new((end.get() / 8).next_power_of_two())?;
-        if start > size {
+
+        // Place it at the first size aligned address of the range: [size, 2 * size) when the
+        // range starts at or below size, otherwise higher up (e.g. a GPU VA range that starts at
+        // 4 GiB).
+        let base = NonZeroU64::new(
+            cmp::max(start.get(), size.get()).checked_next_multiple_of(size.get())?,
+        )?;
+        if base.get().checked_add(size.get())? > end.get() {
             return None;
         }
 
         let mut allocs = Vec::new();
         for dev in devs {
-            allocs.push(dev.screen().alloc_vm(size, size)?);
+            allocs.push(dev.screen().alloc_vm(base, size)?);
         }
 
         Some(PlatformVM {
-            vm: Mutex::new(VM::new(size, size)),
+            vm: Mutex::new(VM::new(base, size)),
             _dev_allocs: allocs,
         })
     }

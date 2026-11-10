@@ -14,8 +14,10 @@
 #include "util/bitset.h"
 #include "util/disk_cache.h"
 #include "util/log.h"
+#include "util/list.h"
 #include "util/set.h"
 #include "util/u_blitter.h"
+#include "util/simple_mtx.h"
 #include "util/u_dynarray.h"
 
 #include "pan_device.h"
@@ -160,6 +162,12 @@ struct panfrost_screen {
 
    int force_afrc_rate;
    uint64_t compute_core_mask;
+
+   /* OpenCL SVM cut-outs of the SAME_VA range (alloc_vm). */
+   struct {
+      simple_mtx_t lock;
+      struct list_head list;
+   } vm_allocs;
    uint64_t fragment_core_mask;
 
    struct {

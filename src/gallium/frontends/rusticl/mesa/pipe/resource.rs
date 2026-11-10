@@ -145,6 +145,14 @@ impl PipeResourceOwned {
         self.as_ref().flags & PIPE_RESOURCE_FLAG_RUSTICL_IS_USER != 0
     }
 
+    /// Marks a resource whose storage the driver mapped at a host pointer of the frontend.
+    pub fn set_user(&mut self) {
+        // SAFETY: it contains a valid pointer and we own a reference.
+        unsafe {
+            self.pipe.as_mut().flags |= PIPE_RESOURCE_FLAG_RUSTICL_IS_USER;
+        }
+    }
+
     pub fn resource_get_address(&self) -> Option<NonZeroU64> {
         let screen_ptr = self.as_ref().screen;
         // SAFETY: it's a valid pointer and everything.
