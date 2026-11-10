@@ -144,6 +144,7 @@ enum CompiledKernelArgType {
     WorkDim,
     WorkGroupOffsets,
     NumWorkgroups,
+    SharedSize,
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -291,6 +292,7 @@ impl CompiledKernelArg {
                     CompiledKernelArgType::WorkGroupOffsets => blob_write_uint8(blob, 7),
                     CompiledKernelArgType::NumWorkgroups => blob_write_uint8(blob, 8),
                     CompiledKernelArgType::GlobalWorkSize => blob_write_uint8(blob, 9),
+                    CompiledKernelArgType::SharedSize => blob_write_uint8(blob, 11),
                     CompiledKernelArgType::APIArg(idx) => {
                         blob_write_uint8(blob, 10);
                         blob_write_uint32(blob, idx as u32)
@@ -325,6 +327,7 @@ impl CompiledKernelArg {
                     7 => CompiledKernelArgType::WorkGroupOffsets,
                     8 => CompiledKernelArgType::NumWorkgroups,
                     9 => CompiledKernelArgType::GlobalWorkSize,
+                    11 => CompiledKernelArgType::SharedSize,
                     10 => {
                         let idx = blob_read_uint32(blob) as usize;
                         CompiledKernelArgType::APIArg(idx)
@@ -845,6 +848,10 @@ fn compile_nir_variant(
             .nir_shader_compiler_options(mesa_shader_stage::MESA_SHADER_COMPUTE)
     };
 
+    // Generic pointers are flat 64-bit addresses: global, shared and function memory are all
+    // lowered to global accesses first, see rusticl_lower_global_to_shared_scratch.
+    let flat_generic = dev.generic_address_space_supported();
+
     if dev.address_bits() == 64 {
         address_bits_ptr_type = unsafe { glsl_uint64_t_type() };
         address_bits_base_type = glsl_base_type::GLSL_TYPE_UINT64;
@@ -852,7 +859,7 @@ fn compile_nir_variant(
         // When load/store_global_offset is supported by the backend, we should use the
         // 64bit_global_32bit_offset format to get the most efficient lowering from
         // nir_lower_explicit_io.
-        global_address_format = if nir_options.has_global_offset {
+        global_address_format = if nir_options.has_global_offset && !flat_generic {
             nir_address_format::nir_address_format_64bit_global_32bit_offset
         } else {
             nir_address_format::nir_address_format_64bit_global
@@ -982,6 +989,17 @@ fn compile_nir_variant(
         );
     }
 
+    // run-time address space checks of generic pointers need the size of the local memory
+    if flat_generic && unsafe { rusticl_has_mode_checks(nir.get_nir()) } {
+        add_var(
+            nir,
+            &mut lower_state.shared_size_loc,
+            CompiledKernelArgType::SharedSize,
+            unsafe { glsl_uint_type() },
+            c"shared_size",
+        );
+    }
+
     if nir.reads_sysval(gl_system_value::SYSTEM_VALUE_WORK_DIM) {
         add_var(
             nir,
@@ -1044,22 +1062,58 @@ fn compile_nir_variant(
         );
     }
 
-    nir_pass!(
-        nir,
-        nir_lower_explicit_io,
-        nir_variable_mode::nir_var_mem_global | nir_variable_mode::nir_var_mem_constant,
-        global_address_format,
-    );
+    if flat_generic {
+        let is_local: Vec<bool> = args
+            .iter()
+            .map(|a| a.kind == KernelArgType::MemLocal)
+            .collect();
+        nir_pass!(
+            nir,
+            rusticl_lower_local_args_to_global,
+            is_local.as_ptr(),
+            is_local.len() as u32,
+        );
+        nir_pass!(nir, rusticl_lower_shared_scratch_vars_to_global);
 
-    nir_pass!(nir, rusticl_lower_intrinsics, &mut lower_state);
-    nir_pass!(
-        nir,
-        nir_lower_explicit_io,
-        nir_variable_mode::nir_var_mem_shared
-            | nir_variable_mode::nir_var_function_temp
-            | nir_variable_mode::nir_var_uniform,
-        shared_address_format,
-    );
+        nir_pass!(
+            nir,
+            nir_lower_explicit_io,
+            nir_variable_mode::nir_var_mem_global
+                | nir_variable_mode::nir_var_mem_constant
+                | nir_variable_mode::nir_var_mem_shared
+                | nir_variable_mode::nir_var_function_temp
+                | nir_variable_mode::nir_var_mem_generic,
+            global_address_format,
+        );
+
+        nir_pass!(nir, rusticl_lower_intrinsics, &mut lower_state);
+        nir_pass!(
+            nir,
+            nir_lower_explicit_io,
+            nir_variable_mode::nir_var_uniform,
+            shared_address_format,
+        );
+
+        opt_nir(nir, dev, true);
+        nir_pass!(nir, rusticl_lower_global_to_shared_scratch);
+    } else {
+        nir_pass!(
+            nir,
+            nir_lower_explicit_io,
+            nir_variable_mode::nir_var_mem_global | nir_variable_mode::nir_var_mem_constant,
+            global_address_format,
+        );
+
+        nir_pass!(nir, rusticl_lower_intrinsics, &mut lower_state);
+        nir_pass!(
+            nir,
+            nir_lower_explicit_io,
+            nir_variable_mode::nir_var_mem_shared
+                | nir_variable_mode::nir_var_function_temp
+                | nir_variable_mode::nir_var_uniform,
+            shared_address_format,
+        );
+    }
 
     if nir_options.lower_int64_options.0 != 0 && !nir_options.late_lower_int64 {
         nir_pass!(nir, nir_lower_int64);
@@ -1937,6 +1991,10 @@ impl Kernel {
                     }
                     CompiledKernelArgType::WorkDim => {
                         exec_builder.add_values(&[work_dim as u8; 1]);
+                    }
+                    CompiledKernelArgType::SharedSize => {
+                        // all API arguments come first, so this is the final size
+                        exec_builder.add_values(&(variable_local_size as u32).to_ne_bytes());
                     }
                     CompiledKernelArgType::NumWorkgroups => {
                         let grid = [grid[0] as u32, grid[1] as u32, grid[2] as u32];

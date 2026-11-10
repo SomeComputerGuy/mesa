@@ -857,6 +857,13 @@ struct pipe_compute_caps {
    unsigned max_variable_threads_per_block;
    uint64_t max_mem_alloc_size;
    uint64_t max_global_size;
+   /**
+    * Shared and scratch memory can also be accessed through 64-bit global
+    * addresses: the driver implements load_shared_base_ptr and
+    * load_scratch_base_ptr, and global memory intrinsics accept such
+    * addresses.  Frontends use this for OpenCL generic pointers.
+    */
+   bool shared_scratch_global_addr;
 };
 
 struct pipe_mesh_caps {

@@ -688,6 +688,11 @@ impl DeviceBase {
             add_ext(1, 0, 0, "cl_khr_fp16");
         }
 
+        if self.generic_address_space_supported() {
+            add_cap(SpvCapability::SpvCapabilityGenericPointer);
+            add_feat(1, 0, 0, "__opencl_c_generic_address_space");
+        }
+
         if self.fp64_supported() {
             add_cap(SpvCapability::SpvCapabilityFloat64);
             add_ext(1, 0, 0, "cl_khr_fp64");
@@ -867,6 +872,12 @@ impl DeviceBase {
 
     pub fn address_bits(&self) -> cl_uint {
         self.screen.compute_caps().address_bits
+    }
+
+    /// OpenCL generic address space: generic pointers are flat 64-bit addresses, which needs a
+    /// driver that reaches shared and scratch memory through global addresses.
+    pub fn generic_address_space_supported(&self) -> bool {
+        self.address_bits() == 64 && self.screen.compute_caps().shared_scratch_global_addr
     }
 
     pub fn const_max_size(&self) -> cl_ulong {
@@ -1382,6 +1393,7 @@ impl DeviceBase {
             extended_bit_ops: true,
             fp16: self.fp16_supported(),
             fp64: self.fp64_supported(),
+            generic_address_space: self.generic_address_space_supported(),
             int64: self.int64_supported(),
             images: self.caps.has_images,
             images_depth: self.caps.has_depth_images,
@@ -1445,6 +1457,7 @@ impl DeviceBase {
             caps: &self.spirv_caps,
             address_bits: self.address_bits(),
             float_controls: spirv_float_controls,
+            flat_generic: self.generic_address_space_supported(),
         }
     }
 

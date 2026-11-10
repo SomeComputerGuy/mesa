@@ -1646,6 +1646,21 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       bi_emit_load(b, instr, BI_SEG_TL, VA_MEMORY_ACCESS_FORCE);
       break;
 
+   case nir_intrinsic_load_shared_base_ptr:
+   case nir_intrinsic_load_scratch_base_ptr: {
+      /* 64-bit address of offset 0 of this work-group's local storage or
+       * this thread's local storage, as used by OpenCL generic pointers.
+       * Global loads, stores and atomics accept these addresses.
+       */
+      assert(b->shader->arch < 9 && instr->def.bit_size == 64);
+      enum bi_seg seg = instr->intrinsic == nir_intrinsic_load_shared_base_ptr
+                           ? BI_SEG_WLS
+                           : BI_SEG_TL;
+      bi_seg_add_i64_to(b, dst, bi_zero(), bi_zero(), false, seg);
+      bi_emit_cached_split(b, dst, 64);
+      break;
+   }
+
    case nir_intrinsic_store_scratch:
       bi_emit_store(b, instr, BI_SEG_TL, VA_MEMORY_ACCESS_FORCE);
       break;

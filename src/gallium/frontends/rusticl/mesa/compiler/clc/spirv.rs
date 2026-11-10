@@ -100,6 +100,9 @@ pub struct SPIRVToNirOptions<'a> {
     pub caps: &'a spirv_capabilities,
     pub address_bits: u32,
     pub float_controls: float_controls,
+    /// Generic pointers as flat 64-bit global addresses: shared and function memory pointers are
+    /// global addresses as well (see `pipe_compute_caps::shared_scratch_global_addr`).
+    pub flat_generic: bool,
 }
 
 impl SPIRVBin {
@@ -303,6 +306,11 @@ impl SPIRVBin {
         if options.address_bits == 32 {
             global_addr_format = nir_address_format::nir_address_format_32bit_global;
             offset_addr_format = nir_address_format::nir_address_format_32bit_offset;
+        } else if options.flat_generic {
+            // A generic pointer is a cast of a pointer of any other address space, so all of
+            // them have to share one address format.
+            global_addr_format = nir_address_format::nir_address_format_64bit_global;
+            offset_addr_format = nir_address_format::nir_address_format_64bit_global;
         } else {
             global_addr_format = nir_address_format::nir_address_format_64bit_global;
             offset_addr_format = nir_address_format::nir_address_format_32bit_offset_as_64bit;
