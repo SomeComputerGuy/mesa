@@ -251,6 +251,16 @@ panfrost_dev_query_props(struct panfrost_kmod_dev *panfrost_dev)
    }
 
    props->pgsize_bitmap = PAN_PGSIZE_4K | PAN_PGSIZE_2M;
+
+   /* Kernels without SAME_VA BOs reject the parameters. */
+   props->same_va_start =
+      panfrost_query_raw(fd, DRM_PANFROST_PARAM_SAME_VA_START, false, 0);
+   props->same_va_end =
+      panfrost_query_raw(fd, DRM_PANFROST_PARAM_SAME_VA_END, false, 0);
+   if (props->same_va_end > props->same_va_start)
+      props->supported_bo_flags |= PAN_KMOD_BO_FLAG_SAME_VA;
+   else
+      props->same_va_start = props->same_va_end = 0;
 }
 
 static struct pan_kmod_dev *
@@ -307,6 +317,13 @@ to_panfrost_bo_flags(struct pan_kmod_dev *dev, uint32_t flags)
    if (flags & PAN_KMOD_BO_FLAG_WB_MMAP) {
       assert(!(flags & PAN_KMOD_BO_FLAG_NO_MMAP));
       panfrost_flags |= PANFROST_BO_WB_MMAP;
+   }
+
+   if (flags & PAN_KMOD_BO_FLAG_SAME_VA) {
+      assert(!(flags & (PAN_KMOD_BO_FLAG_NO_MMAP |
+                        PAN_KMOD_BO_FLAG_EXECUTABLE |
+                        PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT)));
+      panfrost_flags |= PANFROST_BO_SAME_VA;
    }
 
    return panfrost_flags;

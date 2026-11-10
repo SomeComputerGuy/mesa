@@ -46,6 +46,8 @@ to_kmod_bo_flags(uint32_t flags)
       kmod_bo_flags |= PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT;
    if (flags & PAN_BO_INVISIBLE)
       kmod_bo_flags |= PAN_KMOD_BO_FLAG_NO_MMAP;
+   if (flags & PAN_BO_SAME_VA)
+      kmod_bo_flags |= PAN_KMOD_BO_FLAG_SAME_VA;
 
    return kmod_bo_flags;
 }
@@ -68,6 +70,13 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
    bo = pan_lookup_bo(dev, kmod_bo->handle);
    assert(!memcmp(bo, &((struct panfrost_bo){0}), sizeof(*bo)));
    bo->kmod_bo = kmod_bo;
+
+   /* The GPU address comes with panfrost_bo_bind_same_va(). */
+   if (flags & PAN_BO_SAME_VA) {
+      bo->flags = flags;
+      bo->dev = dev;
+      return bo;
+   }
 
    struct pan_kmod_vm_op vm_op = {
       .type = PAN_KMOD_VM_OP_TYPE_MAP,
@@ -111,8 +120,16 @@ panfrost_bo_free(struct panfrost_bo *bo)
    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
    uint64_t gpu_va = bo->ptr.gpu;
 
+   bool same_va = bo->flags & PAN_BO_SAME_VA;
+
    /* BO will be freed with the sparse array, but zero to indicate free */
    memset(bo, 0, sizeof(*bo));
+
+   /* The kernel unmaps a SAME_VA BO from the GPU with its CPU mapping. */
+   if (same_va) {
+      pan_kmod_bo_put(kmod_bo);
+      return;
+   }
 
    struct pan_kmod_vm_op vm_op = {
       .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
@@ -263,7 +280,8 @@ panfrost_bo_cache_put(struct panfrost_bo *bo)
 {
    struct panfrost_device *dev = bo->dev;
 
-   if (bo->flags & PAN_BO_SHARED || dev->debug & PAN_DBG_NO_CACHE)
+   if (bo->flags & (PAN_BO_SHARED | PAN_BO_SAME_VA) ||
+       dev->debug & PAN_DBG_NO_CACHE)
       return false;
 
    /* Must be first */
@@ -325,12 +343,50 @@ panfrost_bo_mmap(struct panfrost_bo *bo)
    if (bo->ptr.cpu)
       return 0;
 
+   /* Only panfrost_bo_bind_same_va() may place the mapping. */
+   if (bo->flags & PAN_BO_SAME_VA)
+      return -1;
+
    bo->ptr.cpu =
       pan_kmod_bo_mmap(bo->kmod_bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
    if (bo->ptr.cpu == MAP_FAILED) {
       bo->ptr.cpu = NULL;
       return -1;
    }
+
+   return 0;
+}
+
+/* Maps a PAN_BO_SAME_VA BO at @address on the CPU, replacing whatever the
+ * caller reserved there; the kernel maps it on the GPU at the same address.
+ * @address 0 forgets the binding after the caller unmapped that range itself.
+ */
+int
+panfrost_bo_bind_same_va(struct panfrost_bo *bo, uint64_t address)
+{
+   assert(bo->flags & PAN_BO_SAME_VA);
+
+   if (!address) {
+      bo->ptr.cpu = NULL;
+      bo->ptr.gpu = 0;
+      return 0;
+   }
+
+   if (bo->ptr.cpu)
+      return bo->ptr.gpu == address ? 0 : -1;
+
+   void *ptr = pan_kmod_bo_mmap(bo->kmod_bo, PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_FIXED,
+                                (void *)(uintptr_t)address);
+   if (ptr == MAP_FAILED)
+      return -1;
+
+   bo->ptr.cpu = ptr;
+   bo->ptr.gpu = address;
+
+   if (bo->dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))
+      pandecode_inject_mmap(bo->dev->decode_ctx, bo->ptr.gpu, bo->ptr.cpu,
+                            panfrost_bo_size(bo), NULL);
 
    return 0;
 }
@@ -378,6 +434,10 @@ panfrost_bo_create(struct panfrost_device *dev, size_t size, uint32_t flags,
    /* GROWABLE BOs cannot be mmapped */
    if (flags & PAN_BO_GROWABLE)
       assert(flags & PAN_BO_INVISIBLE);
+
+   /* SAME_VA BOs are never cached, and mapped by the binding. */
+   if (flags & PAN_BO_SAME_VA)
+      flags |= PAN_BO_DELAY_MMAP;
 
    /* Ideally, we get a BO that's ready in the cache, or allocate a fresh
     * BO. If allocation fails, we can try waiting for something in the

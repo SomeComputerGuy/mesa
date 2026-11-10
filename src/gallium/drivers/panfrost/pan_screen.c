@@ -686,6 +686,13 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    struct panfrost_device *dev = &screen->dev;
 
+   /* OpenCL SVM: SAME_VA BOs are mapped on the GPU at their CPU address. */
+   if (dev->kmod.dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_SAME_VA) {
+      caps->min_vma = dev->kmod.dev->props.same_va_start;
+      caps->max_vma = dev->kmod.dev->props.same_va_end;
+      caps->vm_cpu_shared = true;
+   }
+
    /* Our GL 3.x implementation is WIP */
    bool is_gl3 = dev->debug & PAN_DBG_GL3;
 

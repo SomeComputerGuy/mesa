@@ -129,6 +129,14 @@ enum pan_kmod_bo_flags {
     * the KMD to force non-coherent mappings on IO coherent setup.
     */
    PAN_KMOD_BO_FLAG_IO_COHERENT = BITFIELD_BIT(7),
+
+   /* The buffer gets no GPU VA at allocation time: mmap()ing it maps it on
+    * the GPU at the CPU address of the mapping, inside
+    * [pan_kmod_dev_props::same_va_start, same_va_end), for as long as the
+    * CPU mapping exists (OpenCL SVM). Not compatible with
+    * PAN_KMOD_BO_FLAG_EXECUTABLE or PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT.
+    */
+   PAN_KMOD_BO_FLAG_SAME_VA = BITFIELD_BIT(8),
 };
 
 /* Allowed group priority flags. */
@@ -269,6 +277,10 @@ struct pan_kmod_dev_props {
 
    /* Bitmask encoding the available GPU page sizes */
    uint64_t pgsize_bitmap;
+
+   /* Range of the PAN_KMOD_BO_FLAG_SAME_VA mappings, empty if not supported. */
+   uint64_t same_va_start;
+   uint64_t same_va_end;
 };
 
 /* Memory allocator for kmod internal allocations. */

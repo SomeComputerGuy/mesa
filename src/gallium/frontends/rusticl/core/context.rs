@@ -385,7 +385,7 @@ impl Context {
                 )
             };
 
-            let res = res.ok_or(CL_OUT_OF_RESOURCES)?;
+            let mut res = res.ok_or(CL_OUT_OF_RESOURCES)?;
             if !dev.system_svm_supported() {
                 if Platform::dbg().memory {
                     eprintln!("assigning {address:x} to {res:?}");
@@ -393,6 +393,12 @@ impl Context {
 
                 if !dev.screen().resource_assign_vma(&res, address) {
                     return Err(CL_OUT_OF_RESOURCES);
+                }
+
+                // The driver mapped the resource itself at `ptr`: host and device share the
+                // storage, like a user pointer resource, so nothing ever needs migrating.
+                if dev.screen().caps().vm_cpu_shared {
+                    res.set_user();
                 }
             }
 

@@ -130,6 +130,7 @@ struct drm_panfrost_wait_bo {
 #define PANFROST_BO_NOEXEC	1
 #define PANFROST_BO_HEAP	2
 #define PANFROST_BO_WB_MMAP	4
+#define PANFROST_BO_SAME_VA	8
 
 /**
  * struct drm_panfrost_create_bo - ioctl argument for creating Panfrost BOs.
@@ -236,6 +237,8 @@ enum drm_panfrost_param {
 	DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY,
 	DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES,
 	DRM_PANFROST_PARAM_SELECTED_COHERENCY,
+	DRM_PANFROST_PARAM_SAME_VA_START,
+	DRM_PANFROST_PARAM_SAME_VA_END,
 };
 
 enum drm_panfrost_gpu_coherency {

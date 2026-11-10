@@ -403,6 +403,11 @@ panthor_kmod_bo_alloc(struct pan_kmod_dev *dev,
       return NULL;
    }
 
+   if (flags & PAN_KMOD_BO_FLAG_SAME_VA) {
+      mesa_loge("panthor_kmod doesn't support PAN_KMOD_BO_FLAG_SAME_VA");
+      return NULL;
+   }
+
    struct panthor_kmod_vm *panthor_vm =
       exclusive_vm ? container_of(exclusive_vm, struct panthor_kmod_vm, base)
                    : NULL;

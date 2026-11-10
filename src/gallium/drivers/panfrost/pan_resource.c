@@ -1168,6 +1168,12 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
       if (template->bind & PIPE_BIND_SHARED)
          flags |= PAN_BO_SHAREABLE;
 
+      /* Placed by panfrost_resource_assign_vma(). */
+      if (template->flags & PIPE_RESOURCE_FLAG_FRONTEND_VM) {
+         assert(template->target == PIPE_BUFFER);
+         flags |= PAN_BO_SAME_VA;
+      }
+
       char *res_label =
          panfrost_resource_new_label(so, so->image.props.modifier , NULL);
 
@@ -1705,7 +1711,7 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
           * importer/exporter wouldn't see the change we're
           * doing to it.
           */
-         if (!(bo->flags & PAN_BO_SHARED)) {
+         if (!(bo->flags & (PAN_BO_SHARED | PAN_BO_SAME_VA))) {
             newbo =
                panfrost_bo_create(dev, panfrost_bo_size(bo), flags, bo->label);
          }
@@ -2578,6 +2584,78 @@ static const struct u_transfer_vtbl transfer_vtbl = {
    .get_stencil = panfrost_resource_get_stencil,
 };
 
+/* OpenCL SVM. The kernel owns the SAME_VA range and refuses mappings that
+ * collide, so a cut-out only has to lie inside the range and not overlap
+ * another one.
+ */
+struct panfrost_vm_allocation {
+   struct pipe_vm_allocation base;
+   struct list_head link;
+};
+
+static struct pipe_vm_allocation *
+panfrost_alloc_vm(struct pipe_screen *pscreen, uint64_t start, uint64_t size)
+{
+   struct panfrost_screen *screen = pan_screen(pscreen);
+   const struct pan_kmod_dev_props *props = &screen->dev.kmod.dev->props;
+   struct panfrost_vm_allocation *alloc = NULL;
+
+   if (start < props->same_va_start || start >= props->same_va_end ||
+       size > props->same_va_end - start)
+      return NULL;
+
+   simple_mtx_lock(&screen->vm_allocs.lock);
+   list_for_each_entry(struct panfrost_vm_allocation, it,
+                       &screen->vm_allocs.list, link) {
+      if (start < it->base.start + it->base.size &&
+          it->base.start < start + size)
+         goto out;
+   }
+
+   alloc = CALLOC_STRUCT(panfrost_vm_allocation);
+   if (alloc) {
+      alloc->base.start = start;
+      alloc->base.size = size;
+      list_addtail(&alloc->link, &screen->vm_allocs.list);
+   }
+
+out:
+   simple_mtx_unlock(&screen->vm_allocs.lock);
+   return alloc ? &alloc->base : NULL;
+}
+
+static void
+panfrost_free_vm(struct pipe_screen *pscreen, struct pipe_vm_allocation *base)
+{
+   struct panfrost_screen *screen = pan_screen(pscreen);
+   struct panfrost_vm_allocation *alloc =
+      container_of(base, struct panfrost_vm_allocation, base);
+
+   simple_mtx_lock(&screen->vm_allocs.lock);
+   list_del(&alloc->link);
+   simple_mtx_unlock(&screen->vm_allocs.lock);
+   FREE(alloc);
+}
+
+/* Maps the BO at @address on the CPU (replacing the frontend's reservation
+ * there) and so on the GPU. @address 0 unbinds, after the frontend unmapped
+ * the range.
+ */
+static bool
+panfrost_resource_assign_vma(struct pipe_screen *pscreen,
+                             struct pipe_resource *prsrc, uint64_t address)
+{
+   struct panfrost_resource *rsrc = pan_resource(prsrc);
+
+   assert(prsrc->flags & PIPE_RESOURCE_FLAG_FRONTEND_VM);
+
+   if (panfrost_bo_bind_same_va(rsrc->bo, address))
+      return false;
+
+   rsrc->plane.base = rsrc->bo->ptr.gpu;
+   return true;
+}
+
 void
 panfrost_resource_screen_init(struct pipe_screen *pscreen)
 {
@@ -2590,6 +2668,18 @@ panfrost_resource_screen_init(struct pipe_screen *pscreen)
    pscreen->resource_get_handle = panfrost_resource_get_handle;
    pscreen->set_resource_label = panfrost_set_resource_label;
    pscreen->resource_get_param = panfrost_resource_get_param;
+
+   if (pan_device(pscreen)->kmod.dev->props.supported_bo_flags &
+       PAN_KMOD_BO_FLAG_SAME_VA) {
+      struct panfrost_screen *screen = pan_screen(pscreen);
+
+      simple_mtx_init(&screen->vm_allocs.lock, mtx_plain);
+      list_inithead(&screen->vm_allocs.list);
+      pscreen->alloc_vm = panfrost_alloc_vm;
+      pscreen->free_vm = panfrost_free_vm;
+      pscreen->resource_assign_vma = panfrost_resource_assign_vma;
+   }
+
    pscreen->transfer_helper = u_transfer_helper_create(
       &transfer_vtbl,
       U_TRANSFER_HELPER_SEPARATE_Z32S8 | U_TRANSFER_HELPER_MSAA_MAP);
@@ -2597,6 +2687,9 @@ panfrost_resource_screen_init(struct pipe_screen *pscreen)
 void
 panfrost_resource_screen_destroy(struct pipe_screen *pscreen)
 {
+   if (pscreen->alloc_vm)
+      simple_mtx_destroy(&pan_screen(pscreen)->vm_allocs.lock);
+
    u_transfer_helper_destroy(pscreen->transfer_helper);
 }
 

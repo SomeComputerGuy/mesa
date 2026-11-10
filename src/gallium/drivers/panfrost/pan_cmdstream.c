@@ -3694,6 +3694,13 @@ panfrost_launch_grid_on_batch(struct pipe_context *pipe,
       panfrost_batch_write_rsrc(batch, buffer, MESA_SHADER_COMPUTE);
    }
 
+   /* Buffers reached through raw pointers only (e.g. OpenCL SVM). */
+   for (unsigned i = 0; i < info->num_globals; i++) {
+      if (info->globals[i])
+         panfrost_batch_write_rsrc(batch, pan_resource(info->globals[i]),
+                                   MESA_SHADER_COMPUTE);
+   }
+
    if (info->indirect && !PAN_GPU_SUPPORTS_DISPATCH_INDIRECT) {
       struct pipe_transfer *transfer;
       uint32_t *params =
