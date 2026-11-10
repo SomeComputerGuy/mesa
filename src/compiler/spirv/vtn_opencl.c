@@ -1362,7 +1362,10 @@ vtn_pipe_copy(struct vtn_builder *b, nir_def *pipe, nir_def *index,
    nir_def *addr = nir_iadd(nb, nir_iadd_imm(nb, pipe, VTN_PIPE_HEADER),
                             nir_u2u64(nb, slot));
 
-   unsigned chunk = 4;
+   /* at most 16 chunks of a vector packet (nir_opt_deref turns these loads
+    * of a vector into a vector load + bitcast): up to 8 bytes
+    */
+   unsigned chunk = 8;
    while (chunk > 1 && (size % chunk || align % chunk))
       chunk /= 2;
    const struct glsl_type *type = glsl_uintN_t_type(chunk * 8);
