@@ -82,12 +82,19 @@ lower_tes_load(nir_builder *b, nir_intrinsic_instr *intr)
 static nir_def *
 tcs_load_input(nir_builder *b, nir_intrinsic_instr *intr)
 {
-   nir_def *base = nir_imul(
-      b, tcs_unrolled_id(b),
-      poly_tcs_patch_vertices_in(b, nir_load_tess_param_buffer_poly(b)));
-   nir_def *vertex = nir_iadd(b, base, intr->src[0].ssa);
+   nir_def *p = nir_load_tess_param_buffer_poly(b);
+   nir_def *patch_size = poly_tcs_patch_vertices_in(b, p);
+   nir_def *wg = nir_load_workgroup_id(b);
 
-   return poly_load_per_vertex_input(b, intr, vertex);
+   /* Draw-order vertex within the instance and the instance */
+   nir_def *vertex =
+      nir_iadd(b, nir_imul(b, nir_channel(b, wg, 0), patch_size),
+               intr->src[0].ssa);
+   nir_def *vp = nir_load_vertex_param_buffer_poly(b);
+   nir_def *id = poly_vs_output_vertex(b, vp, nir_channel(b, wg, 1), vertex,
+                                       poly_input_vertices(b, vp));
+
+   return poly_load_per_vertex_input(b, intr, id);
 }
 
 static nir_def *

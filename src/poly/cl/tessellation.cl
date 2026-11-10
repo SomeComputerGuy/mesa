@@ -19,6 +19,12 @@ poly_tes_patch_vertices_in(constant struct poly_tess_params *p)
 }
 
 uint
+poly_tcs_patches_per_instance(constant struct poly_tess_params *p)
+{
+   return p->patches_per_instance;
+}
+
+uint
 poly_tcs_unrolled_id(constant struct poly_tess_params *p, uint3 wg_id)
 {
    return (wg_id.y * p->patches_per_instance) + wg_id.x;
@@ -69,29 +75,53 @@ poly_tcs_out_address(constant struct poly_tess_params *p, uint patch_id,
    return (uintptr_t)(p->tcs_buffer) + (((uintptr_t)offs_el) << 2);
 }
 
+/* Dense domain points: the patch of a point from the prefix sum of the
+ * per-patch point counts (first patch whose inclusive sum exceeds the ID).
+ */
 static uint
-tes_unrolled_patch_id(uint raw_id)
+tes_dense_patch_id(constant struct poly_tess_params *p, uint raw_id)
 {
-   return raw_id / POLY_TES_PATCH_ID_STRIDE;
+   uint lo = 0, hi = p->nr_patches - 1;
+
+   while (lo < hi) {
+      uint mid = (lo + hi) / 2;
+
+      if (p->point_counts[mid] > raw_id)
+         hi = mid;
+      else
+         lo = mid + 1;
+   }
+
+   return lo;
+}
+
+static uint
+tes_unrolled_patch_id(constant struct poly_tess_params *p, uint raw_id)
+{
+   if (p->point_counts)
+      return tes_dense_patch_id(p, raw_id);
+   else
+      return raw_id / POLY_TES_PATCH_ID_STRIDE;
 }
 
 uint
 poly_tes_patch_id(constant struct poly_tess_params *p, uint raw_id)
 {
-   return tes_unrolled_patch_id(raw_id) % p->patches_per_instance;
-}
-
-static uint
-tes_vertex_id_in_patch(uint raw_id)
-{
-   return raw_id % POLY_TES_PATCH_ID_STRIDE;
+   return tes_unrolled_patch_id(p, raw_id) % p->patches_per_instance;
 }
 
 float2
 poly_load_tess_coord(constant struct poly_tess_params *p, uint raw_id)
 {
-   uint patch = tes_unrolled_patch_id(raw_id);
-   uint vtx = tes_vertex_id_in_patch(raw_id);
+   uint patch, vtx;
+
+   if (p->point_counts) {
+      patch = tes_dense_patch_id(p, raw_id);
+      vtx = raw_id - (patch == 0 ? 0 : p->point_counts[patch - 1]);
+   } else {
+      patch = raw_id / POLY_TES_PATCH_ID_STRIDE;
+      vtx = raw_id % POLY_TES_PATCH_ID_STRIDE;
+   }
 
    global struct poly_tess_point *t =
       &p->patch_coord_buffer[p->coord_allocs[patch] + vtx];
@@ -107,7 +137,7 @@ uintptr_t
 poly_tes_in_address(constant struct poly_tess_params *p, uint raw_id, uint vtx_id,
                     gl_varying_slot location)
 {
-   uint patch = tes_unrolled_patch_id(raw_id);
+   uint patch = tes_unrolled_patch_id(p, raw_id);
 
    return poly_tcs_out_address(p, patch, vtx_id, location,
                                p->tcs_patch_constants, p->output_patch_size,

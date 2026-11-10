@@ -243,6 +243,25 @@ poly_vertex_output_address(constant struct poly_vertex_params *p,
       ((uintptr_t)poly_tcs_in_offs_el(vtx, location, mask)) * 16;
 }
 
+/*
+ * Map a vertex of a later stage's input (instance, draw-order vertex within the
+ * instance) to the vertex shader invocation that shaded it. Without
+ * hw_indexed, the vertex shader ran once per draw-order vertex.
+ */
+uint
+poly_vs_output_vertex(constant struct poly_vertex_params *p, uint instance,
+                      uint vertex, uint verts_per_instance)
+{
+   if (p->hw_indexed) {
+      uint index = poly_load_index(p->index_buffer, p->index_buffer_range_el,
+                                   vertex, p->index_size_B);
+
+      return (instance * p->verts_per_instance) + (index - p->index_min);
+   }
+
+   return (instance * verts_per_instance) + vertex;
+}
+
 unsigned
 poly_index_size(constant struct poly_vertex_params *p)
 {
