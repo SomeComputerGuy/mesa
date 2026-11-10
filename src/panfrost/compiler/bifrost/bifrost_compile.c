@@ -1656,6 +1656,15 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       enum bi_seg seg = instr->intrinsic == nir_intrinsic_load_shared_base_ptr
                            ? BI_SEG_WLS
                            : BI_SEG_TL;
+
+      /* Without thread storage the TL segment starts at address 0, so a
+       * pointer to a private variable that got promoted to registers would
+       * be NULL for the first thread. Keep a little storage so it is a real
+       * address.
+       */
+      if (seg == BI_SEG_TL)
+         b->shader->info.tls_size = MAX2(b->shader->info.tls_size, 16);
+
       bi_seg_add_i64_to(b, dst, bi_zero(), bi_zero(), false, seg);
       bi_emit_cached_split(b, dst, 64);
       break;
