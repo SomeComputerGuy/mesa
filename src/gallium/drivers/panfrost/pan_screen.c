@@ -921,6 +921,17 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
       modes &= ~BITFIELD_BIT(MESA_PRIM_QUADS);
    }
 
+   /* Geometry and tessellation shaders (libpoly) take the input topology
+    * as is: patches and adjacency must not be converted by u_vbuf.
+    */
+   if (dev->arch >= 6 && dev->arch <= 7) {
+      modes |= BITFIELD_BIT(MESA_PRIM_PATCHES) |
+               BITFIELD_BIT(MESA_PRIM_LINES_ADJACENCY) |
+               BITFIELD_BIT(MESA_PRIM_LINE_STRIP_ADJACENCY) |
+               BITFIELD_BIT(MESA_PRIM_TRIANGLES_ADJACENCY) |
+               BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP_ADJACENCY);
+   }
+
    caps->supported_prim_modes =
    caps->supported_prim_modes_with_restart = modes;
 

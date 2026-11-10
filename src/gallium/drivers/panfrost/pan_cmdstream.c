@@ -3459,6 +3459,17 @@ panfrost_draw_get_vertex_count(struct panfrost_batch *batch,
  * written by a compute job).
  */
 
+/* panfrost_batch_skip_rasterization() also skips when the batch has no
+ * vertex shader descriptor yet, which is only emitted later in the draw:
+ * check the rasterizer and scissor state alone.
+ */
+static bool
+panfrost_poly_skip_rasterization(struct panfrost_batch *batch)
+{
+   return batch->ctx->rasterizer->base.rasterizer_discard ||
+          batch->scissor_culls_everything;
+}
+
 /* Run a libpoly compute program with the bound resources of stage st */
 static void
 panfrost_launch_poly_compute(struct panfrost_batch *batch, mesa_shader_stage st,
@@ -3600,7 +3611,7 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
     * shader leaves nothing observable (no side effects in geometry shaders).
     * TODO: transform feedback and primitive queries with geometry shaders.
     */
-   if (panfrost_batch_skip_rasterization(batch))
+   if (panfrost_poly_skip_rasterization(batch))
       return;
 
    struct panfrost_compiled_shader *saved_vs = ctx->prog[MESA_SHADER_VERTEX];
@@ -3799,7 +3810,7 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
       return;
 
    /* TODO: transform feedback and primitive queries with tessellation */
-   if (panfrost_batch_skip_rasterization(batch))
+   if (panfrost_poly_skip_rasterization(batch))
       return;
 
    unsigned nr_patches = in_patches * info->instance_count;
@@ -4196,6 +4207,15 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    ctx->draw_calls++;
 
 #if PAN_ARCH >= 6 && PAN_ARCH <= 7
+   /* Adjacency primitives are only drawn through a geometry shader.
+    * TODO: passthrough geometry shader when none is bound.
+    */
+   if (mesa_prim_has_adjacency(info->mode) &&
+       !ctx->uncompiled[MESA_SHADER_GEOMETRY]) {
+      perf_debug(ctx, "Adjacency draw without a geometry shader dropped");
+      return;
+   }
+
    /* Geometry shader and tessellation draws apply the input topology in
     * compute programs, which do not know about primitive restart: split the
     * draw on the CPU.
