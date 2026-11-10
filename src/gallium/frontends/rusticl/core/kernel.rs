@@ -145,6 +145,9 @@ enum CompiledKernelArgType {
     WorkGroupOffsets,
     NumWorkgroups,
     SharedSize,
+    EnqueuedLocalSize,
+    /// The buffer of the program-scope global variables, with their initial values
+    ProgramGlobals(Arc<Vec<u8>>),
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -276,11 +279,11 @@ impl CompiledKernelArg {
             for arg in args {
                 blob_write_uint32(blob, arg.offset as u32);
                 blob_write_uint8(blob, arg.dead.into());
-                match arg.kind {
+                match &arg.kind {
                     CompiledKernelArgType::ConstantBuffer => blob_write_uint8(blob, 0),
                     CompiledKernelArgType::GlobalWorkOffsets => blob_write_uint8(blob, 1),
                     CompiledKernelArgType::PrintfBuffer => blob_write_uint8(blob, 2),
-                    CompiledKernelArgType::InlineSampler((addr_mode, filter_mode, norm)) => {
+                    &CompiledKernelArgType::InlineSampler((addr_mode, filter_mode, norm)) => {
                         blob_write_uint8(blob, 3);
                         blob_write_uint8(blob, norm.into());
                         blob_write_uint32(blob, addr_mode);
@@ -293,7 +296,13 @@ impl CompiledKernelArg {
                     CompiledKernelArgType::NumWorkgroups => blob_write_uint8(blob, 8),
                     CompiledKernelArgType::GlobalWorkSize => blob_write_uint8(blob, 9),
                     CompiledKernelArgType::SharedSize => blob_write_uint8(blob, 11),
-                    CompiledKernelArgType::APIArg(idx) => {
+                    CompiledKernelArgType::EnqueuedLocalSize => blob_write_uint8(blob, 12),
+                    CompiledKernelArgType::ProgramGlobals(init) => {
+                        blob_write_uint8(blob, 13);
+                        blob_write_uint32(blob, init.len() as u32);
+                        blob_write_bytes(blob, init.as_ptr().cast(), init.len())
+                    }
+                    &CompiledKernelArgType::APIArg(idx) => {
                         blob_write_uint8(blob, 10);
                         blob_write_uint32(blob, idx as u32)
                     }
@@ -328,6 +337,17 @@ impl CompiledKernelArg {
                     8 => CompiledKernelArgType::NumWorkgroups,
                     9 => CompiledKernelArgType::GlobalWorkSize,
                     11 => CompiledKernelArgType::SharedSize,
+                    12 => CompiledKernelArgType::EnqueuedLocalSize,
+                    13 => {
+                        let len = blob_read_uint32(blob) as usize;
+                        let ptr = blob_read_bytes(blob, len);
+                        if ptr.is_null() {
+                            return None;
+                        }
+                        CompiledKernelArgType::ProgramGlobals(Arc::new(
+                            slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec(),
+                        ))
+                    }
                     10 => {
                         let idx = blob_read_uint32(blob) as usize;
                         CompiledKernelArgType::APIArg(idx)
@@ -461,6 +481,18 @@ impl Index<NirKernelVariant> for NirKernelBuilds {
 }
 
 impl NirKernelBuilds {
+    /// Size of the program-scope global variables of the program of this kernel
+    pub fn program_globals_size(&self) -> usize {
+        self.default_build
+            .compiled_args
+            .iter()
+            .find_map(|a| match &a.kind {
+                CompiledKernelArgType::ProgramGlobals(init) => Some(init.len()),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     fn new(default_build: NirKernelBuild, optimized: Option<NirKernelBuild>) -> Self {
         Self {
             default_build: default_build,
@@ -731,6 +763,10 @@ fn compile_nir_to_args(
 
     nir_pass!(nir, rusticl_insert_libclc_config);
 
+    if nir.has_global_pointer_initializers() {
+        return Err(c"program-scope variables initialized with addresses are not supported");
+    }
+
     nir.inline(lib_clc);
     nir = nir
         .cleanup_functions()
@@ -739,6 +775,15 @@ fn compile_nir_to_args(
     nir.sweep_mem();
 
     nir_pass!(nir, nir_dedup_inline_samplers);
+
+    // work-group collectives: needs structured control flow, so after inlining
+    if dev.wg_collectives_supported() {
+        nir_pass!(
+            nir,
+            rusticl_lower_wg_collectives,
+            dev.max_threads_per_block() as u32
+        );
+    }
 
     let printf_opts = nir_lower_printf_options {
         max_buffer_size: dev.printf_buffer_size() as u32,
@@ -885,6 +930,12 @@ fn compile_nir_variant(
     if variant != NirKernelVariant::Optimized {
         compute_options.set_has_base_global_invocation_id(true);
         compute_options.set_has_base_workgroup_id(true);
+        // non-uniform work-groups run only with this variant: the global id uses the enqueued
+        // work-group size, which the last work-groups of a dimension do not have
+        compute_options.set_has_enqueued_workgroup_size(true);
+        nir_pass!(nir, rusticl_lower_non_uniform_ids);
+        // a fixed (required) work-group size would hide the size of those work-groups
+        nir.set_workgroup_size_variable();
     }
     nir_pass!(nir, nir_lower_compute_system_values, &compute_options);
     nir.gather_info();
@@ -940,6 +991,16 @@ fn compile_nir_variant(
         );
     }
 
+    if nir.reads_sysval(gl_system_value::SYSTEM_VALUE_ENQUEUED_WORKGROUP_SIZE) {
+        add_var(
+            nir,
+            &mut lower_state.enqueued_local_size_loc,
+            CompiledKernelArgType::EnqueuedLocalSize,
+            unsafe { glsl_vector_type(glsl_base_type::GLSL_TYPE_UINT, 3) },
+            c"enqueued_local_size",
+        );
+    }
+
     if nir.reads_sysval(gl_system_value::SYSTEM_VALUE_NUM_WORKGROUPS) {
         add_var(
             nir,
@@ -957,6 +1018,22 @@ fn compile_nir_variant(
             CompiledKernelArgType::ConstantBuffer,
             address_bits_ptr_type,
             c"constant_buffer_addr",
+        );
+    }
+    // program-scope global variables: the initial values (filled in below, once laid out) travel
+    // with the kernel build (also through the disk cache); the buffer is created once per program
+    // and device, at the first launch (Program::globals_buffer)
+    let has_globals = nir
+        .variables_with_mode(nir_variable_mode::nir_var_mem_global)
+        .next()
+        .is_some();
+    if has_globals {
+        add_var(
+            nir,
+            &mut lower_state.program_globals_loc,
+            CompiledKernelArgType::ProgramGlobals(Arc::default()),
+            address_bits_ptr_type,
+            c"program_globals_addr",
         );
     }
     if nir.has_printf() {
@@ -1024,6 +1101,16 @@ fn compile_nir_variant(
         Some(glsl_get_cl_type_size_align),
     );
 
+    // every kernel of a program has all its program-scope variables (none was removed so far), in
+    // the same order: one layout for the whole program
+    if has_globals {
+        let init = nir
+            .global_initializers()
+            .expect("pointer initializers are refused in compile_nir_to_args");
+        compiled_args[lower_state.program_globals_loc].kind =
+            CompiledKernelArgType::ProgramGlobals(Arc::new(init));
+    }
+
     opt_nir(nir, dev, true);
     nir_pass!(nir, nir_lower_memcpy);
 
@@ -1035,6 +1122,8 @@ fn compile_nir_variant(
     // we might have got rid of more function_temp or shared memory
     nir.reset_scratch_size();
     nir.reset_shared_size();
+    // nir_var_mem_generic below includes the global variables: same layout again, from 0
+    nir.reset_global_mem_size();
     nir_pass!(
         nir,
         nir_remove_dead_variables,
@@ -1749,6 +1838,7 @@ impl Kernel {
         let work_group_size_hint = self.kernel_info.work_group_size_hint;
         let args = self.kernel_info.args.clone();
         let nir_kernel_builds = Arc::clone(&self.builds[dev]);
+        let prog = Arc::clone(&self.prog);
         let mut bdas = self.bdas.clone();
         let svms = self.svms.clone();
 
@@ -1784,12 +1874,22 @@ impl Kernel {
 
         let api_grid = grid;
 
+        // non-uniform work-groups: the work-items the local size does not divide form a last,
+        // smaller work-group in their dimension (validated by the API)
+        let mut remainder = [0u32; 3];
+        if !block.contains(&0) {
+            for i in 0..3 {
+                remainder[i] = (grid[i] % block[i] as usize) as u32;
+            }
+        }
+
         self.optimize_local_size(dev, work_dim, &mut grid, &mut block);
 
         Ok(Box::new(move |cl_ctx, ctx| {
             let hw_max_grid = ctx.dev.max_grid_size();
 
             let variant = if offsets == [0; 3]
+                && remainder == [0; 3]
                 && grid[0] <= hw_max_grid[0]
                 && grid[1] <= hw_max_grid[1]
                 && grid[2] <= hw_max_grid[2]
@@ -1801,6 +1901,15 @@ impl Kernel {
             };
 
             let nir_kernel_build = &nir_kernel_builds[variant];
+            let program_globals = nir_kernel_build
+                .compiled_args
+                .iter()
+                .find_map(|a| match &a.kind {
+                    CompiledKernelArgType::ProgramGlobals(init) => Some(init),
+                    _ => None,
+                })
+                .map(|init| prog.globals_buffer(ctx.dev, init))
+                .transpose()?;
             let mut exec_builder =
                 KernelExecBuilder::new(ctx.dev, nir_kernel_build.input_size, buffer_arcs.len() + 2);
             // Set it once so we get the alignment padding right
@@ -1959,6 +2068,9 @@ impl Kernel {
                             }
                         }
                     }
+                    CompiledKernelArgType::ProgramGlobals(_) => {
+                        exec_builder.add_global(program_globals.as_ref().unwrap(), 0);
+                    }
                     CompiledKernelArgType::ConstantBuffer => {
                         assert!(nir_kernel_build.constant_buffer.is_some());
                         let res = nir_kernel_build.constant_buffer.as_ref().unwrap();
@@ -1997,8 +2109,12 @@ impl Kernel {
                         exec_builder.add_values(&(variable_local_size as u32).to_ne_bytes());
                     }
                     CompiledKernelArgType::NumWorkgroups => {
-                        let grid = [grid[0] as u32, grid[1] as u32, grid[2] as u32];
-                        exec_builder.add_values(unsafe { as_byte_slice(&grid) });
+                        let n: [u32; 3] =
+                            std::array::from_fn(|i| (grid[i] + (remainder[i] != 0) as usize) as u32);
+                        exec_builder.add_values(unsafe { as_byte_slice(&n) });
+                    }
+                    CompiledKernelArgType::EnqueuedLocalSize => {
+                        exec_builder.add_values(unsafe { as_byte_slice(&block) });
                     }
                 }
             }
@@ -2059,32 +2175,59 @@ impl Kernel {
 
             ctx.memory_barrier(read_barriers);
 
-            for z in 0..grid[2].div_ceil(hw_max_grid[2]) {
-                for y in 0..grid[1].div_ceil(hw_max_grid[1]) {
-                    for x in 0..grid[0].div_ceil(hw_max_grid[0]) {
-                        let this_offsets =
-                            [x * hw_max_grid[0], y * hw_max_grid[1], z * hw_max_grid[2]];
+            // Per dimension the full work-groups, then the last smaller one of a non-uniform
+            // NDRange as (work-group offset, count, block size): up to 8 dispatches, as the Arm
+            // blob splits the job.
+            let parts: [Vec<(usize, usize, u32)>; 3] = std::array::from_fn(|i| {
+                let mut p = Vec::with_capacity(2);
+                if grid[i] > 0 {
+                    p.push((0, grid[i], block[i]));
+                }
+                if remainder[i] != 0 {
+                    p.push((grid[i], 1, remainder[i]));
+                }
+                p
+            });
 
-                        // Each iteration we need to update the kernel side workgroup id offsets.
-                        exec_builder.set_workgroup_id_offset(this_offsets);
+            for &(oz, nz, bz) in &parts[2] {
+                for &(oy, ny, by) in &parts[1] {
+                    for &(ox, nx, bx) in &parts[0] {
+                        let this_block = [bx, by, bz];
+                        let part_grid = [nx, ny, nz];
+                        let part_offset = [ox, oy, oz];
+                        for z in 0..nz.div_ceil(hw_max_grid[2]) {
+                            for y in 0..ny.div_ceil(hw_max_grid[1]) {
+                                for x in 0..nx.div_ceil(hw_max_grid[0]) {
+                                    let chunk = [x, y, z];
+                                    let this_offsets: [usize; 3] = std::array::from_fn(|i| {
+                                        part_offset[i] + chunk[i] * hw_max_grid[i]
+                                    });
 
-                        let this_grid = [
-                            cmp::min(hw_max_grid[0], grid[0] - hw_max_grid[0] * x) as u32,
-                            cmp::min(hw_max_grid[1], grid[1] - hw_max_grid[1] * y) as u32,
-                            cmp::min(hw_max_grid[2], grid[2] - hw_max_grid[2] * z) as u32,
-                        ];
+                                    // Each iteration we need to update the kernel side workgroup
+                                    // id offsets.
+                                    exec_builder.set_workgroup_id_offset(this_offsets);
 
-                        ctx.update_cb0(exec_builder.input())?;
-                        ctx.launch_grid(
-                            work_dim,
-                            block,
-                            this_grid,
-                            variable_local_size as u32,
-                            &bdas,
-                        );
+                                    let this_grid: [u32; 3] = std::array::from_fn(|i| {
+                                        cmp::min(
+                                            hw_max_grid[i],
+                                            part_grid[i] - hw_max_grid[i] * chunk[i],
+                                        ) as u32
+                                    });
 
-                        if Platform::dbg().sync_every_event {
-                            ctx.flush().wait();
+                                    ctx.update_cb0(exec_builder.input())?;
+                                    ctx.launch_grid(
+                                        work_dim,
+                                        this_block,
+                                        this_grid,
+                                        variable_local_size as u32,
+                                        &bdas,
+                                    );
+
+                                    if Platform::dbg().sync_every_event {
+                                        ctx.flush().wait();
+                                    }
+                                }
+                            }
                         }
                     }
                 }

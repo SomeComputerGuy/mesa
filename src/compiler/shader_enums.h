@@ -848,6 +848,10 @@ typedef enum
    SYSTEM_VALUE_WORKGROUP_INDEX,
    SYSTEM_VALUE_NUM_WORKGROUPS,
    SYSTEM_VALUE_WORKGROUP_SIZE,
+   /** OpenCL get_enqueued_local_size(): the work-group size of the NDRange,
+    * which differs from SYSTEM_VALUE_WORKGROUP_SIZE in the last, partial,
+    * work-groups of non-uniform NDRanges. */
+   SYSTEM_VALUE_ENQUEUED_WORKGROUP_SIZE,
    SYSTEM_VALUE_GLOBAL_GROUP_SIZE,
    SYSTEM_VALUE_WORK_DIM,
    SYSTEM_VALUE_USER_DATA_AMD,

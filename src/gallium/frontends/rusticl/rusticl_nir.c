@@ -77,6 +77,12 @@ rusticl_lower_intrinsics_instr(
         return nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->global_size_loc));
     case nir_intrinsic_load_num_workgroups:
         return nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->num_workgroups_loc));
+    case nir_intrinsic_load_enqueued_workgroup_size:
+        return nir_u2uN(b, nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->enqueued_local_size_loc)),
+                        intrins->def.bit_size);
+    case nir_intrinsic_load_global_base_ptr:
+        /* program-scope global variables: the buffer of the program */
+        return nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->program_globals_loc));
     case nir_intrinsic_load_constant_base_ptr:
         return nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->const_buf_loc));
     case nir_intrinsic_load_printf_buffer_address:
@@ -465,4 +471,245 @@ rusticl_lower_shared_scratch_vars_to_global(nir_shader *nir)
    if (progress)
       nir_fixup_deref_modes(nir);
    return progress;
+}
+
+/* OpenCL work-group collectives (the workgroup_* intrinsics from spirv_to_nir),
+ * lowered in the shader the way the Arm Mali blob does them (decoded from its
+ * G31 binaries):
+ *  - 32-bit integer reductions (and so work_group_all/any): one shared word per
+ *    call, set to the identity by invocation 0, combined with shared atomics
+ *    between barriers;
+ *  - work_group_broadcast: one shared slot, written by the source invocation;
+ *  - scans and the other reductions: every invocation stores its value to a
+ *    shared array (one per bit size, max_invocations long) and folds the part
+ *    of it it needs, all in the same order, so a reduction gives every
+ *    invocation the same result.
+ * Every collective starts with a barrier, so its slot and the array may be
+ * reused right after it (in a loop, or by the next collective).
+ */
+struct wg_collectives_state {
+   unsigned max_invocations;
+   nir_variable *arrays[4];
+};
+
+static void
+wg_barrier(nir_builder *b)
+{
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+}
+
+static nir_def *
+wg_linear(nir_builder *b, nir_def *id, nir_def *sz)
+{
+   return nir_iadd(b, nir_channel(b, id, 0),
+                   nir_imul(b, nir_channel(b, sz, 0),
+                            nir_iadd(b, nir_channel(b, id, 1),
+                                     nir_imul(b, nir_channel(b, id, 2),
+                                              nir_channel(b, sz, 1)))));
+}
+
+/* element idx of a shared array: the index has the pointer size of the deref */
+static nir_deref_instr *
+wg_elem(nir_builder *b, nir_variable *arr, nir_def *idx)
+{
+   nir_deref_instr *d = nir_build_deref_var(b, arr);
+   return nir_build_deref_array(b, d, nir_u2uN(b, idx, d->def.bit_size));
+}
+
+static nir_atomic_op
+wg_atomic_op(nir_op op)
+{
+   switch (op) {
+   case nir_op_iadd: return nir_atomic_op_iadd;
+   case nir_op_imin: return nir_atomic_op_imin;
+   case nir_op_umin: return nir_atomic_op_umin;
+   case nir_op_imax: return nir_atomic_op_imax;
+   case nir_op_umax: return nir_atomic_op_umax;
+   case nir_op_iand: return nir_atomic_op_iand;
+   case nir_op_ior:  return nir_atomic_op_ior;
+   case nir_op_ixor: return nir_atomic_op_ixor;
+   default:          return (nir_atomic_op)-1;
+   }
+}
+
+static bool
+lower_wg_collective(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct wg_collectives_state *state = data;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_workgroup_reduce:
+   case nir_intrinsic_workgroup_inclusive_scan:
+   case nir_intrinsic_workgroup_exclusive_scan:
+   case nir_intrinsic_workgroup_broadcast:
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *x = intr->src[0].ssa;
+   const unsigned bs = x->bit_size;
+   nir_def *sz = nir_load_workgroup_size(b);
+   nir_def *lid = wg_linear(b, nir_load_local_invocation_id(b), sz);
+   nir_def *res;
+
+   if (intr->intrinsic == nir_intrinsic_workgroup_broadcast) {
+      nir_variable *slot = nir_variable_create(b->shader, nir_var_mem_shared,
+                                               glsl_uintN_t_type(bs), "wg_broadcast");
+      nir_def *src = wg_linear(b, intr->src[1].ssa, sz);
+      wg_barrier(b);
+      nir_push_if(b, nir_ieq(b, lid, src));
+      nir_store_var(b, slot, x, 1);
+      nir_pop_if(b, NULL);
+      wg_barrier(b);
+      res = nir_load_var(b, slot);
+      nir_def_replace(&intr->def, res);
+      return true;
+   }
+
+   nir_op op = nir_intrinsic_reduction_op(intr);
+   nir_const_value ident_c = nir_alu_binop_identity(op, bs);
+   nir_def *ident = nir_build_imm(b, 1, bs, &ident_c);
+
+   if (intr->intrinsic == nir_intrinsic_workgroup_reduce && bs == 32 &&
+       wg_atomic_op(op) != (nir_atomic_op)-1) {
+      nir_variable *slot = nir_variable_create(b->shader, nir_var_mem_shared,
+                                               glsl_uint_type(), "wg_reduce");
+      wg_barrier(b);
+      nir_push_if(b, nir_ieq_imm(b, lid, 0));
+      nir_store_var(b, slot, ident, 1);
+      nir_pop_if(b, NULL);
+      wg_barrier(b);
+      nir_deref_atomic(b, 32, &nir_build_deref_var(b, slot)->def, x,
+                       .atomic_op = wg_atomic_op(op));
+      wg_barrier(b);
+      res = nir_load_var(b, slot);
+      nir_def_replace(&intr->def, res);
+      return true;
+   }
+
+   const unsigned si = util_logbase2(bs / 8);
+   assert(bs >= 8 && si < ARRAY_SIZE(state->arrays));
+   if (!state->arrays[si]) {
+      state->arrays[si] =
+         nir_variable_create(b->shader, nir_var_mem_shared,
+                             glsl_array_type(glsl_uintN_t_type(bs), state->max_invocations, 0),
+                             "wg_collective");
+   }
+   nir_variable *arr = state->arrays[si];
+
+   wg_barrier(b);
+   nir_store_deref(b, wg_elem(b, arr, lid), x, 1);
+   wg_barrier(b);
+
+   nir_def *end;
+   if (intr->intrinsic == nir_intrinsic_workgroup_reduce)
+      end = nir_imul(b, nir_imul(b, nir_channel(b, sz, 0), nir_channel(b, sz, 1)),
+                     nir_channel(b, sz, 2));
+   else if (intr->intrinsic == nir_intrinsic_workgroup_inclusive_scan)
+      end = nir_iadd_imm(b, lid, 1);
+   else
+      end = lid;
+
+   nir_variable *acc = nir_local_variable_create(b->impl, glsl_uintN_t_type(bs), "wg_acc");
+   nir_variable *i = nir_local_variable_create(b->impl, glsl_uint_type(), "wg_i");
+   nir_store_var(b, acc, ident, 1);
+   nir_store_var(b, i, nir_imm_int(b, 0), 1);
+   nir_push_loop(b);
+   {
+      nir_def *iv = nir_load_var(b, i);
+      nir_break_if(b, nir_uge(b, iv, end));
+      nir_def *v = nir_load_deref(b, wg_elem(b, arr, iv));
+      nir_store_var(b, acc, nir_build_alu2(b, op, nir_load_var(b, acc), v), 1);
+      nir_store_var(b, i, nir_iadd_imm(b, iv, 1), 1);
+   }
+   nir_pop_loop(b, NULL);
+   res = nir_load_var(b, acc);
+   nir_def_replace(&intr->def, res);
+   return true;
+}
+
+bool
+rusticl_lower_wg_collectives(nir_shader *nir, unsigned max_invocations)
+{
+   struct wg_collectives_state state = { .max_invocations = max_invocations };
+   return nir_shader_intrinsics_pass(nir, lower_wg_collective, nir_metadata_none, &state);
+}
+
+/* Non-uniform work-groups: the last work-groups of a dimension that the
+ * work-group size does not divide run as their own dispatches with the
+ * remainder as block size and the work-group offset of their position (the Arm
+ * blob splits the job the same way). The global id has to use the enqueued
+ * work-group size then, not the size of the dispatch. Runs before
+ * nir_lower_compute_system_values.
+ */
+static bool
+lower_non_uniform_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_invocation_id &&
+       intr->intrinsic != nir_intrinsic_load_global_invocation_index)
+      return false;
+
+   const unsigned bs = intr->def.bit_size;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *group = nir_iadd(b, nir_u2uN(b, nir_load_workgroup_id(b), bs),
+                             nir_load_base_workgroup_id(b, bs));
+   nir_def *id = nir_iadd(b, nir_imul(b, group, nir_load_enqueued_workgroup_size(b, bs)),
+                          nir_u2uN(b, nir_load_local_invocation_id(b), bs));
+
+   if (intr->intrinsic == nir_intrinsic_load_global_invocation_index) {
+      /* OpenCL's global_linear_id ignores the global offset, as the id here */
+      nir_def *size = nir_load_global_size(b, bs);
+      nir_def *index = nir_imul(b, nir_channel(b, id, 2), nir_channel(b, size, 1));
+      index = nir_iadd(b, nir_channel(b, id, 1), index);
+      index = nir_imul(b, nir_channel(b, size, 0), index);
+      id = nir_iadd(b, nir_channel(b, id, 0), index);
+   }
+
+   nir_def_replace(&intr->def, id);
+   return true;
+}
+
+bool
+rusticl_lower_non_uniform_ids(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, lower_non_uniform_id,
+                                     nir_metadata_control_flow, NULL);
+}
+
+/* Program-scope global variables, laid out by nir_lower_vars_to_explicit_types
+ * (driver_location, global_mem_size, the same layout in every kernel of a
+ * program): writes their initial values to dst (global_mem_size bytes),
+ * zero for variables without an initializer. Pointer initializers (addresses
+ * of other variables) are not supported: returns false then.
+ */
+bool
+rusticl_gather_global_initializers(nir_shader *nir, void *dst)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_global) {
+      if (var->pointer_initializer)
+         return false;
+      if (!var->constant_initializer) {
+         nir_constant *zero = rzalloc(nir, nir_constant);
+         zero->is_null_constant = true;
+         var->constant_initializer = zero;
+      }
+   }
+   memset(dst, 0, nir->global_mem_size);
+   nir_gather_explicit_io_initializers(nir, dst, nir->global_mem_size, nir_var_mem_global);
+   return true;
+}
+
+bool
+rusticl_has_global_pointer_initializers(nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_global) {
+      if (var->pointer_initializer)
+         return true;
+   }
+   return false;
 }

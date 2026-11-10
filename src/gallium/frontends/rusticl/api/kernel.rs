@@ -743,6 +743,13 @@ fn enqueue_ndrange_kernel(
     let device_bits = q.device.address_bits();
     let device_max = u64::MAX >> (u64::BITS - device_bits);
 
+    // non-uniform work-groups are allowed unless the program asks for uniform ones
+    let uniform_wg = !q.device.non_uniform_wg_supported()
+        || k.prog.build_info().uniform_work_group_size(
+            q.device,
+            matches!(k.prog.src, ProgramSourceType::Src(_)),
+        );
+
     let mut threads = 1;
     for i in 0..work_dim as usize {
         let lws = local_work_size[i];
@@ -762,7 +769,7 @@ fn enqueue_ndrange_kernel(
         // CL_INVALID_WORK_GROUP_SIZE if the work-group size must be uniform and the
         // local_work_size is not NULL, [...] if the global_work_size is not evenly divisible by
         // the local_work_size.
-        if lws != 0 && gws % lws != 0 {
+        if lws != 0 && gws % lws != 0 && uniform_wg {
             return Err(CL_INVALID_WORK_GROUP_SIZE);
         }
 

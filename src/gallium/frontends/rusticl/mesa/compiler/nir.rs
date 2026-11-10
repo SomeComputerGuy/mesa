@@ -357,6 +357,12 @@ impl NirShader {
         unsafe { (*self.nir.as_ptr()).scratch_size }
     }
 
+    pub fn reset_global_mem_size(&mut self) {
+        unsafe {
+            (*self.nir.as_ptr()).global_mem_size = 0;
+        }
+    }
+
     pub fn reset_shared_size(&mut self) {
         unsafe {
             (*self.nir.as_ptr()).info.shared_size = 0;
@@ -386,6 +392,13 @@ impl NirShader {
         let nir = unsafe { self.nir.as_mut() };
         nir.info.set_workgroup_size_variable(false);
         nir.info.workgroup_size = size;
+    }
+
+    /// Forget a fixed workgroup size: the size comes from the dispatch.
+    pub fn set_workgroup_size_variable(&mut self) {
+        let nir = unsafe { self.nir.as_mut() };
+        nir.info.set_workgroup_size_variable(true);
+        nir.info.workgroup_size = [0; 3];
     }
 
     pub fn workgroup_size_variable(&self) -> bool {
@@ -470,6 +483,23 @@ impl NirShader {
         nir.printf_info = ptr::null_mut();
 
         result
+    }
+
+    /// Size of the program-scope global variables (after nir_lower_vars_to_explicit_types).
+    pub fn global_mem_size(&self) -> u32 {
+        unsafe { self.nir.as_ref().global_mem_size }
+    }
+
+    /// Initial values of the program-scope global variables, None if a variable has an
+    /// initializer that is the address of another variable (not supported).
+    pub fn has_global_pointer_initializers(&self) -> bool {
+        unsafe { rusticl_has_global_pointer_initializers(self.nir.as_ptr()) }
+    }
+
+    pub fn global_initializers(&mut self) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; self.global_mem_size() as usize];
+        unsafe { rusticl_gather_global_initializers(self.nir.as_ptr(), buf.as_mut_ptr().cast()) }
+            .then_some(buf)
     }
 
     pub fn get_constant_buffer(&self) -> &[u8] {

@@ -13,6 +13,8 @@ use crate::impl_cl_type_trait;
 use mesa_rust::compiler::clc::spirv::SPIRVBin;
 use mesa_rust::compiler::clc::*;
 use mesa_rust::compiler::nir::*;
+use mesa_rust::pipe::resource::*;
+use mesa_rust::pipe::screen::ResourceType;
 use mesa_rust::util::disk_cache::*;
 use mesa_rust_gen::*;
 use mesa_rust_util::string::CStrExt;
@@ -94,6 +96,8 @@ pub struct Program {
     pub devs: Vec<&'static Device>,
     pub src: ProgramSourceType,
     build: Mutex<ProgramBuild>,
+    /// The buffers of the program-scope global variables, one per device
+    globals: Mutex<HashMap<&'static Device, Arc<PipeResourceOwned>>>,
 }
 
 impl_cl_type_trait!(cl_program, Program, CL_INVALID_PROGRAM);
@@ -199,6 +203,27 @@ impl ProgramBuild {
         &self.dev_build(dev).options.raw_string
     }
 
+    /// The work-group size must be uniform: the program was built with -cl-uniform-work-group-size
+    /// or for OpenCL C 1.x (explicitly, or by default from source).
+    pub fn uniform_work_group_size(&self, dev: &Device, from_source: bool) -> bool {
+        let o = &self.dev_build(dev).options;
+        o.uniform_work_group_size
+            || match o.clc_target {
+                Some(v) => v < CLVersion::Cl2_0,
+                None => from_source && dev.clc_version < CLVersion::Cl2_0,
+            }
+    }
+
+    /// CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE: every kernel has all program-scope variables
+    pub fn global_variable_total_size(&self, dev: &Device) -> usize {
+        self.dev_build(dev)
+            .kernels
+            .values()
+            .map(|k| k.program_globals_size())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn log(&self, dev: &Device) -> &CStr {
         &self.dev_build(dev).log
     }
@@ -282,6 +307,7 @@ struct ParsedCompileOptions {
     raw_string: CString,
     clc_target: Option<CLVersion>,
     create_lib: bool,
+    uniform_work_group_size: bool,
 }
 
 impl ParsedCompileOptions {
@@ -354,7 +380,6 @@ impl CompileOptions {
                 | "-cl-unsafe-math-optimizations"
                 | "-cl-finite-math-only"
                 | "-cl-fast-relaxed-math"
-                | "-cl-uniform-work-group-size"
                 // Warning Options
                 | "-w"
                 | "-Werror"
@@ -373,6 +398,10 @@ impl CompileOptions {
                 "-cl-std=CL2.0" => parsed_options.clc_target = Some(CLVersion::Cl2_0),
                 "-cl-std=CL3.0" => parsed_options.clc_target = Some(CLVersion::Cl3_0),
                 "-cl-std=CL3.1" => parsed_options.clc_target = Some(CLVersion::Cl3_1),
+                "-cl-uniform-work-group-size" => {
+                    parsed_options.uniform_work_group_size = true;
+                    strings.push(CString::new(token).unwrap());
+                }
                 "-cl-denorms-are-zero" => {
                     strings.push(c"-fdenormal-fp-math=positive-zero".to_owned());
                 }
@@ -502,6 +531,7 @@ impl Program {
     pub fn new(context: Arc<Context>, src: CString) -> Arc<Program> {
         Arc::new(Self {
             base: CLObjectBase::new(RusticlTypes::Program),
+            globals: Mutex::default(),
             build: Mutex::new(ProgramBuild {
                 builds_by_device: Self::create_default_builds(&context.devs),
                 spec_constants: HashMap::new(),
@@ -620,6 +650,7 @@ impl Program {
             context: context,
             devs: devs,
             src: ProgramSourceType::Binary,
+            globals: Mutex::default(),
             build: Mutex::new(build),
         }))
     }
@@ -635,6 +666,7 @@ impl Program {
             devs: devs,
             context: context,
             src: ProgramSourceType::Il(SPIRVBin::from_bin(spirv)),
+            globals: Mutex::default(),
             build: Mutex::new(ProgramBuild {
                 builds_by_device: builds,
                 spec_constants: HashMap::new(),
@@ -646,6 +678,37 @@ impl Program {
 
     pub fn from_spirv(context: Arc<Context>, spirv: &[u8]) -> Arc<Program> {
         Self::from_spirv_with_devs(context.devs.clone(), context, spirv)
+    }
+
+    /// The buffer of the program-scope global variables on dev, created with their initial values
+    /// at the first launch of a kernel of the program.
+    pub fn globals_buffer(
+        &self,
+        dev: &'static Device,
+        init: &[u8],
+    ) -> CLResult<Arc<PipeResourceOwned>> {
+        let mut globals = self.globals.lock().unwrap();
+        if let Some(res) = globals.get(dev) {
+            if res.width() as usize == init.len() {
+                return Ok(Arc::clone(res));
+            }
+        }
+
+        let res = dev
+            .screen()
+            .resource_create_buffer(
+                init.len() as u32,
+                ResourceType::Normal,
+                PIPE_BIND_GLOBAL,
+                0,
+            )
+            .ok_or(CL_OUT_OF_RESOURCES)?;
+        dev.helper_ctx()
+            .exec(|ctx| ctx.buffer_subdata(&res, 0, init.as_ptr().cast(), init.len() as u32))
+            .wait();
+        let res = Arc::new(res);
+        globals.insert(dev, Arc::clone(&res));
+        Ok(res)
     }
 
     pub fn build_info(&self) -> MutexGuard<'_, ProgramBuild> {
@@ -961,6 +1024,7 @@ impl Program {
             context: context,
             devs: devices.clone(),
             src: ProgramSourceType::Linked,
+            globals: Mutex::default(),
             build: Mutex::new(build),
         });
 

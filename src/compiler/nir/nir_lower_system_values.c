@@ -758,6 +758,12 @@ lower_compute_system_value_instr(nir_builder *b,
       return NULL;
    }
 
+   case nir_intrinsic_load_enqueued_workgroup_size:
+      /* Without non-uniform work-groups every work-group has the enqueued size */
+      if (options && options->has_enqueued_workgroup_size)
+         return NULL;
+      return nir_u2uN(b, nir_load_workgroup_size(b), bit_size);
+
    case nir_intrinsic_load_workgroup_id: {
       if (options && options->lower_workgroup_id_to_index) {
          nir_def *wg_idx = nir_load_workgroup_index(b);

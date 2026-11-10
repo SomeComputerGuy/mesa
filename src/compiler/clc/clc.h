@@ -50,10 +50,12 @@ enum clc_spirv_version {
 };
 
 struct clc_optional_features {
+   bool atomic_order_acq_rel;
    bool atomic_order_seq_cst;
    bool atomic_scope_device;
    bool atomic_fp32_add;
    bool atomic_fp32_minmax;
+   bool atomic_scope_all_devices;
    bool extended_bit_ops;
    bool fp16;
    bool fp64;
@@ -71,6 +73,7 @@ struct clc_optional_features {
    bool integer_dot_product;
    bool intel_subgroups;
    bool kernel_clock;
+   bool program_scope_global_variables;
    /* OpenCL core subgroups */
    bool subgroups;
    /* OpenCL extension cl_khr_subgroups, which requires independent forward
@@ -86,6 +89,7 @@ struct clc_optional_features {
    bool subgroups_rotate;
    bool subgroups_shuffle;
    bool subgroups_shuffle_relative;
+   bool work_group_collective_functions;
 };
 
 struct clc_compile_args {

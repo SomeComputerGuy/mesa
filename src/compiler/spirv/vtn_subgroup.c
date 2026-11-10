@@ -49,11 +49,128 @@ vtn_build_subgroup_instr(struct vtn_builder *b,
    return dst;
 }
 
+/* OpenCL work-group collectives (work-group scope OpGroup*): emitted as the
+ * workgroup_* intrinsics, which the OpenCL frontend lowers in the shader once
+ * the control flow is structured (rusticl_lower_wg_collectives).
+ */
+static bool
+vtn_is_wg_collective(struct vtn_builder *b, SpvOp opcode, const uint32_t *w)
+{
+   if (!b->options->cl_max_workgroup_invocations)
+      return false;
+
+   switch (opcode) {
+   case SpvOpGroupAll:
+   case SpvOpGroupAny:
+   case SpvOpGroupBroadcast:
+   case SpvOpGroupIAdd:
+   case SpvOpGroupFAdd:
+   case SpvOpGroupFMin:
+   case SpvOpGroupUMin:
+   case SpvOpGroupSMin:
+   case SpvOpGroupFMax:
+   case SpvOpGroupUMax:
+   case SpvOpGroupSMax:
+   case SpvOpGroupIMulKHR:
+   case SpvOpGroupFMulKHR:
+   case SpvOpGroupBitwiseAndKHR:
+   case SpvOpGroupBitwiseOrKHR:
+   case SpvOpGroupBitwiseXorKHR:
+   case SpvOpGroupLogicalAndKHR:
+   case SpvOpGroupLogicalOrKHR:
+   case SpvOpGroupLogicalXorKHR:
+      return vtn_constant_uint(b, w[3]) == SpvScopeWorkgroup;
+   default:
+      return false;
+   }
+}
+
+static nir_def *
+vtn_wg_reduce_scan(struct vtn_builder *b, SpvGroupOperation gop, nir_op op,
+                   nir_def *x)
+{
+   nir_builder *nb = &b->nb;
+   vtn_fail_if(x->num_components != 1, "work-group collective of a vector");
+   const bool is_bool = x->bit_size == 1;
+   if (is_bool)
+      x = nir_b2i32(nb, x);
+
+   nir_def *r;
+   switch (gop) {
+   case SpvGroupOperationReduce:
+      r = nir_workgroup_reduce(nb, x, .reduction_op = op);
+      break;
+   case SpvGroupOperationInclusiveScan:
+      r = nir_workgroup_inclusive_scan(nb, x, .reduction_op = op);
+      break;
+   case SpvGroupOperationExclusiveScan:
+      r = nir_workgroup_exclusive_scan(nb, x, .reduction_op = op);
+      break;
+   default:
+      vtn_fail("work-group collective with group operation %u", gop);
+   }
+   return is_bool ? nir_ine_imm(nb, r, 0) : r;
+}
+
+static void
+vtn_handle_wg_collective(struct vtn_builder *b, SpvOp opcode,
+                         const uint32_t *w, unsigned count)
+{
+   nir_op op;
+
+   switch (opcode) {
+   case SpvOpGroupAll:
+   case SpvOpGroupAny:
+      vtn_push_nir_ssa(b, w[2],
+         vtn_wg_reduce_scan(b, SpvGroupOperationReduce,
+                            opcode == SpvOpGroupAll ? nir_op_iand : nir_op_ior,
+                            vtn_get_nir_ssa(b, w[4])));
+      return;
+   case SpvOpGroupBroadcast: {
+      nir_def *x = vtn_get_nir_ssa(b, w[4]);
+      vtn_fail_if(x->num_components != 1, "work_group_broadcast of a vector");
+      nir_def *id = nir_u2u32(&b->nb, vtn_get_nir_ssa(b, w[5]));
+      /* the local id as a vec3, missing components 0 */
+      nir_def *c[3];
+      for (unsigned i = 0; i < 3; i++)
+         c[i] = i < id->num_components ? nir_channel(&b->nb, id, i) : nir_imm_int(&b->nb, 0);
+      vtn_push_nir_ssa(b, w[2], nir_workgroup_broadcast(&b->nb, x, nir_vec(&b->nb, c, 3)));
+      return;
+   }
+   case SpvOpGroupIAdd:          op = nir_op_iadd; break;
+   case SpvOpGroupFAdd:          op = nir_op_fadd; break;
+   case SpvOpGroupFMin:          op = nir_op_fmin; break;
+   case SpvOpGroupUMin:          op = nir_op_umin; break;
+   case SpvOpGroupSMin:          op = nir_op_imin; break;
+   case SpvOpGroupFMax:          op = nir_op_fmax; break;
+   case SpvOpGroupUMax:          op = nir_op_umax; break;
+   case SpvOpGroupSMax:          op = nir_op_imax; break;
+   case SpvOpGroupIMulKHR:       op = nir_op_imul; break;
+   case SpvOpGroupFMulKHR:       op = nir_op_fmul; break;
+   case SpvOpGroupBitwiseAndKHR: op = nir_op_iand; break;
+   case SpvOpGroupBitwiseOrKHR:  op = nir_op_ior;  break;
+   case SpvOpGroupBitwiseXorKHR: op = nir_op_ixor; break;
+   case SpvOpGroupLogicalAndKHR: op = nir_op_iand; break;
+   case SpvOpGroupLogicalOrKHR:  op = nir_op_ior;  break;
+   case SpvOpGroupLogicalXorKHR: op = nir_op_ixor; break;
+   default:
+      UNREACHABLE("not a work-group collective");
+   }
+
+   vtn_push_nir_ssa(b, w[2], vtn_wg_reduce_scan(b, (SpvGroupOperation)w[4], op,
+                                                vtn_get_nir_ssa(b, w[5])));
+}
+
 void
 vtn_handle_subgroup(struct vtn_builder *b, SpvOp opcode,
                     const uint32_t *w, unsigned count)
 {
    struct vtn_type *dest_type = vtn_get_type(b, w[1]);
+
+   if (vtn_is_wg_collective(b, opcode, w)) {
+      vtn_handle_wg_collective(b, opcode, w, count);
+      return;
+   }
 
    switch (opcode) {
    case SpvOpGroupNonUniformElect: {
