@@ -619,6 +619,13 @@ panfrost_init_compute_caps(struct panfrost_screen *screen)
 
    caps->address_bits = 64;
 
+   /* Bifrost reaches work-group local and thread-local storage through
+    * 64-bit addresses formed by SEG_ADD (load_shared_base_ptr,
+    * load_scratch_base_ptr), which ordinary global loads, stores and
+    * atomics accept.
+    */
+   caps->shared_scratch_global_addr = dev->arch >= 6 && dev->arch < 9;
+
    caps->grid_dimension = 3;
 
    caps->max_grid_size[0] =

@@ -88,7 +88,9 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             }
             CL_DEVICE_EXTENSIONS => v.write::<&str>(&dev.extension_string),
             CL_DEVICE_EXTENSIONS_WITH_VERSION => v.write::<&[cl_name_version]>(&dev.extensions),
-            CL_DEVICE_GENERIC_ADDRESS_SPACE_SUPPORT => v.write::<bool>(false),
+            CL_DEVICE_GENERIC_ADDRESS_SPACE_SUPPORT => {
+                v.write::<bool>(dev.generic_address_space_supported())
+            }
             CL_DEVICE_GLOBAL_MEM_CACHE_TYPE => v.write::<cl_device_mem_cache_type>(CL_NONE),
             CL_DEVICE_GLOBAL_MEM_CACHE_SIZE => v.write::<cl_ulong>(0),
             CL_DEVICE_GLOBAL_MEM_CACHELINE_SIZE => v.write::<cl_uint>(0),
