@@ -99,7 +99,9 @@ unsafe impl CLInfoObj<cl_program_build_info, cl_device_id> for cl_program {
         let dev = Device::ref_from_raw(d)?;
         match q {
             CL_PROGRAM_BINARY_TYPE => v.write::<cl_program_binary_type>(prog.bin_type(dev)),
-            CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE => v.write::<usize>(0),
+            CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE => {
+                v.write::<usize>(prog.build_info().global_variable_total_size(dev))
+            }
             CL_PROGRAM_BUILD_LOG => v.write::<&CStr>(prog.build_info().log(dev)),
             CL_PROGRAM_BUILD_OPTIONS => v.write::<&CStr>(prog.build_info().options(dev)),
             CL_PROGRAM_BUILD_STATUS => v.write::<cl_build_status>(prog.status(dev)),

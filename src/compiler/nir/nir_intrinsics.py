@@ -647,6 +647,19 @@ intrinsic("inclusive_scan", src_comp=[0], dest_comp=0, bit_sizes=src0,
 intrinsic("exclusive_scan", src_comp=[0], dest_comp=0, bit_sizes=src0,
           indices=[REDUCTION_OP], flags=SUBGROUP_FLAGS)
 
+# OpenCL work-group collectives (work_group_reduce/scan_*/broadcast): like the
+# subgroup operations above, but over the whole workgroup. Lowered by the
+# OpenCL frontend with shared memory and barriers, so they are never moved or
+# removed. workgroup_broadcast: src[1] is the local id (vec3) of the source
+# invocation.
+intrinsic("workgroup_reduce", src_comp=[1], dest_comp=1, bit_sizes=src0,
+          indices=[REDUCTION_OP])
+intrinsic("workgroup_inclusive_scan", src_comp=[1], dest_comp=1, bit_sizes=src0,
+          indices=[REDUCTION_OP])
+intrinsic("workgroup_exclusive_scan", src_comp=[1], dest_comp=1, bit_sizes=src0,
+          indices=[REDUCTION_OP])
+intrinsic("workgroup_broadcast", src_comp=[1, 3], dest_comp=1, bit_sizes=src0)
+
 # AMD shader ballot operations
 intrinsic("quad_swizzle_amd", src_comp=[0], dest_comp=0, bit_sizes=src0,
           indices=[SWIZZLE_MASK, FETCH_INACTIVE],
@@ -1076,6 +1089,9 @@ system_value("base_global_invocation_id", 3, bit_sizes=[32, 64])
 system_value("global_invocation_index", 1, bit_sizes=[32, 64])
 # threads per dimension in an invocation
 system_value("global_size", 3, bit_sizes=[32, 64])
+# OpenCL get_enqueued_local_size(): the work-group size of the NDRange; the
+# last work-groups of a non-uniform NDRange are smaller (workgroup_size)
+system_value("enqueued_workgroup_size", 3, bit_sizes=[32, 64])
 system_value("work_dim", 1)
 system_value("line_width", 1)
 system_value("aa_line_width", 1)

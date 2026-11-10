@@ -103,6 +103,8 @@ pub struct SPIRVToNirOptions<'a> {
     /// Generic pointers as flat 64-bit global addresses: shared and function memory pointers are
     /// global addresses as well (see `pipe_compute_caps::shared_scratch_global_addr`).
     pub flat_generic: bool,
+    /// Non-zero: lower work-group collectives in the shader for workgroups of up to this size.
+    pub max_workgroup_invocations: u32,
 }
 
 impl SPIRVBin {
@@ -327,6 +329,7 @@ impl SPIRVBin {
             clc_shader: clc_shader,
             float_controls_execution_mode: options.float_controls.0,
             printf: true,
+            cl_max_workgroup_invocations: options.max_workgroup_invocations,
             capabilities: options.caps,
             constant_addr_format: global_addr_format,
             global_addr_format: global_addr_format,

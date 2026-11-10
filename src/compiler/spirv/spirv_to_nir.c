@@ -8037,10 +8037,13 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
          .can_remove_var = can_remove,
          .can_remove_var_data = b->vars_used_indirectly,
       };
+      /* OpenCL program-scope variables stay, see vtn_handle_variables */
       nir_remove_dead_variables(b->shader, ~(nir_var_function_temp |
                                              nir_var_shader_out |
                                              nir_var_shader_in |
-                                             nir_var_system_value),
+                                             nir_var_system_value |
+                                             (b->options->environment == NIR_SPIRV_OPENCL ?
+                                              nir_var_mem_global : 0)),
                                 b->vars_used_indirectly ? &dead_opts : NULL);
    }
 

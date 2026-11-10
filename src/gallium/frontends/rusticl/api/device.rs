@@ -41,14 +41,27 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
         #[allow(non_upper_case_globals)]
         match q {
             CL_DEVICE_ADDRESS_BITS => v.write::<cl_uint>(dev.address_bits()),
+            // every order and scope, as the Arm blob reports on this GPU (0x7f): atomics and
+            // fences of all scopes are plain atomic instructions and barriers, see
+            // __opencl_c_atomic_* in Device::fill_extensions. The work-item scope is a fence scope
+            // only.
             CL_DEVICE_ATOMIC_FENCE_CAPABILITIES => v.write::<cl_device_atomic_capabilities>(
                 (CL_DEVICE_ATOMIC_ORDER_RELAXED
                     | CL_DEVICE_ATOMIC_ORDER_ACQ_REL
-                    | CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP)
+                    | CL_DEVICE_ATOMIC_ORDER_SEQ_CST
+                    | CL_DEVICE_ATOMIC_SCOPE_WORK_ITEM
+                    | CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP
+                    | CL_DEVICE_ATOMIC_SCOPE_DEVICE
+                    | CL_DEVICE_ATOMIC_SCOPE_ALL_DEVICES)
                     as cl_device_atomic_capabilities,
             ),
             CL_DEVICE_ATOMIC_MEMORY_CAPABILITIES => v.write::<cl_device_atomic_capabilities>(
-                (CL_DEVICE_ATOMIC_ORDER_RELAXED | CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP)
+                (CL_DEVICE_ATOMIC_ORDER_RELAXED
+                    | CL_DEVICE_ATOMIC_ORDER_ACQ_REL
+                    | CL_DEVICE_ATOMIC_ORDER_SEQ_CST
+                    | CL_DEVICE_ATOMIC_SCOPE_WORK_GROUP
+                    | CL_DEVICE_ATOMIC_SCOPE_DEVICE
+                    | CL_DEVICE_ATOMIC_SCOPE_ALL_DEVICES)
                     as cl_device_atomic_capabilities,
             ),
             CL_DEVICE_AVAILABLE => v.write::<bool>(true),
@@ -95,7 +108,9 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             CL_DEVICE_GLOBAL_MEM_CACHE_SIZE => v.write::<cl_ulong>(0),
             CL_DEVICE_GLOBAL_MEM_CACHELINE_SIZE => v.write::<cl_uint>(0),
             CL_DEVICE_GLOBAL_MEM_SIZE => v.write::<cl_ulong>(dev.global_mem_size()),
-            CL_DEVICE_GLOBAL_VARIABLE_PREFERRED_TOTAL_SIZE => v.write::<usize>(0),
+            CL_DEVICE_GLOBAL_VARIABLE_PREFERRED_TOTAL_SIZE => {
+                v.write::<usize>(dev.max_global_variable_size())
+            }
             // Provided by the cl_khr_fp16 extension.
             CL_DEVICE_HALF_FP_CONFIG if dev.fp16_supported() => {
                 v.write::<cl_device_fp_config>((CL_FP_ROUND_TO_NEAREST | CL_FP_INF_NAN).into())
@@ -178,7 +193,7 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             // TODO atm implemented as mem_const
             CL_DEVICE_MAX_CONSTANT_ARGS => v.write::<cl_uint>(dev.const_max_count()),
             CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE => v.write::<cl_ulong>(dev.const_max_size()),
-            CL_DEVICE_MAX_GLOBAL_VARIABLE_SIZE => v.write::<usize>(0),
+            CL_DEVICE_MAX_GLOBAL_VARIABLE_SIZE => v.write::<usize>(dev.max_global_variable_size()),
             CL_DEVICE_MAX_MEM_ALLOC_SIZE => v.write::<cl_ulong>(dev.max_mem_alloc()),
             CL_DEVICE_MAX_NUM_SUB_GROUPS => v.write::<cl_uint>(if dev.subgroups_supported() {
                 dev.max_subgroups()
@@ -217,7 +232,9 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             CL_DEVICE_NODE_MASK => {
                 v.write::<cl_uint>(dev.screen().device_node_mask().unwrap_or_default())
             }
-            CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT => v.write::<bool>(false),
+            CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT => {
+                v.write::<bool>(dev.non_uniform_wg_supported())
+            }
             CL_DEVICE_NUMERIC_VERSION => v.write::<cl_version>(dev.cl_version.into()),
             CL_DEVICE_OPENCL_C_ALL_VERSIONS => v.write::<&[cl_name_version]>(&dev.clc_versions),
             CL_DEVICE_OPENCL_C_FEATURES => v.write::<&[cl_name_version]>(&dev.clc_features),
@@ -349,7 +366,9 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
                 dev.screen().driver_uuid().unwrap_or_default(),
             ),
             CL_DRIVER_VERSION => v.write::<&CStr>(unsafe { CStr::from_ptr(mesa_version_string()) }),
-            CL_DEVICE_WORK_GROUP_COLLECTIVE_FUNCTIONS_SUPPORT => v.write::<bool>(false),
+            CL_DEVICE_WORK_GROUP_COLLECTIVE_FUNCTIONS_SUPPORT => {
+                v.write::<bool>(dev.wg_collectives_supported())
+            }
             // CL_INVALID_VALUE if param_name is not one of the supported values
             // CL_INVALID_VALUE [...] if param_name is a value that is available as an extension and the corresponding extension is not supported by the device.
             _ => Err(CL_INVALID_VALUE),

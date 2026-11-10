@@ -1033,8 +1033,11 @@ vtn_get_builtin_location(struct vtn_builder *b,
       set_mode_system_value(b, mode);
       break;
    case SpvBuiltInWorkgroupSize:
-   case SpvBuiltInEnqueuedWorkgroupSize:
       *location = SYSTEM_VALUE_WORKGROUP_SIZE;
+      set_mode_system_value(b, mode);
+      break;
+   case SpvBuiltInEnqueuedWorkgroupSize:
+      *location = SYSTEM_VALUE_ENQUEUED_WORKGROUP_SIZE;
       set_mode_system_value(b, mode);
       break;
    case SpvBuiltInWorkgroupId:
@@ -2403,10 +2406,10 @@ vtn_create_variable(struct vtn_builder *b, struct vtn_value *val,
          break;
 
       case SpvStorageClassCrossWorkgroup:
+         /* OpenCL program-scope global variables: the frontend places them
+          * in a buffer of the program and writes the initializers there.
+          */
          vtn_assert(b->options->environment == NIR_SPIRV_OPENCL);
-         vtn_fail("Initializer for CrossWorkgroup variable %u "
-                  "not yet supported in Mesa.",
-                  vtn_id_for_value(b, val));
          break;
 
       default: {
@@ -2821,7 +2824,14 @@ vtn_handle_variables(struct vtn_builder *b, SpvOp opcode,
        * SPIR-V 1.4 the interface is only used for I/O variables, so extra
        * variables will still need to be removed later.
        */
-      if (!b->options->create_library &&
+      /* OpenCL program-scope (CrossWorkgroup) variables are kept in every
+       * kernel: the frontend lays all of them out in one buffer of the
+       * program, the same way for each kernel.
+       */
+      const bool is_cl_program_var =
+         b->options->environment == NIR_SPIRV_OPENCL &&
+         storage_class == SpvStorageClassCrossWorkgroup;
+      if (!b->options->create_library && !is_cl_program_var &&
           (is_io || (b->version >= 0x10400 && is_global))) {
          if (!bsearch(&w[2], b->interface_ids, b->interface_ids_count, 4, cmp_uint32_t))
             break;

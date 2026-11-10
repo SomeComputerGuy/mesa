@@ -693,6 +693,19 @@ impl DeviceBase {
             add_feat(1, 0, 0, "__opencl_c_generic_address_space");
         }
 
+        // C11 atomics with every memory order and scope (CL_DEVICE_ATOMIC_MEMORY_CAPABILITIES)
+        add_feat(1, 0, 0, "__opencl_c_atomic_order_acq_rel");
+        add_feat(1, 0, 0, "__opencl_c_atomic_order_seq_cst");
+        add_feat(1, 0, 0, "__opencl_c_atomic_scope_device");
+        add_feat(1, 0, 0, "__opencl_c_atomic_scope_all_devices");
+
+        add_feat(1, 0, 0, "__opencl_c_program_scope_global_variables");
+
+        if self.wg_collectives_supported() {
+            add_cap(SpvCapability::SpvCapabilityGroups);
+            add_feat(1, 0, 0, "__opencl_c_work_group_collective_functions");
+        }
+
         if self.fp64_supported() {
             add_cap(SpvCapability::SpvCapabilityFloat64);
             add_ext(1, 0, 0, "cl_khr_fp64");
@@ -860,6 +873,24 @@ impl DeviceBase {
     /// driver that reaches shared and scratch memory through global addresses.
     pub fn generic_address_space_supported(&self) -> bool {
         self.address_bits() == 64 && self.screen.compute_caps().shared_scratch_global_addr
+    }
+
+    /// Work-group collective functions, lowered in the shader through shared memory, barriers and
+    /// shared atomics by spirv_to_nir (cl_max_workgroup_invocations).
+    /// Non-uniform work-groups: the last work-groups of a dimension run as their own dispatches
+    /// (Kernel::launch_with_args).
+    pub fn non_uniform_wg_supported(&self) -> bool {
+        true
+    }
+
+    /// Program-scope global variables: one buffer per program and device, 64 KiB at most as the
+    /// Arm blob reports (and the OpenCL minimum).
+    pub fn max_global_variable_size(&self) -> usize {
+        64 * 1024
+    }
+
+    pub fn wg_collectives_supported(&self) -> bool {
+        true
     }
 
     pub fn const_max_size(&self) -> cl_ulong {
@@ -1370,7 +1401,12 @@ impl DeviceBase {
     pub fn cl_features(&self) -> clc_optional_features {
         let subgroups_supported = self.subgroups_supported();
         clc_optional_features {
+            atomic_order_acq_rel: true,
+            atomic_order_seq_cst: true,
+            atomic_scope_device: true,
+            atomic_scope_all_devices: true,
             extended_bit_ops: true,
+            program_scope_global_variables: true,
             fp16: self.fp16_supported(),
             fp64: self.fp64_supported(),
             generic_address_space: self.generic_address_space_supported(),
@@ -1392,6 +1428,7 @@ impl DeviceBase {
             subgroups_rotate: self.subgroup_rotate_supported(),
             subgroups_shuffle: self.subgroup_shuffle_supported(),
             subgroups_shuffle_relative: self.subgroup_shuffle_relative_supported(),
+            work_group_collective_functions: self.wg_collectives_supported(),
             ..Default::default()
         }
     }
@@ -1425,6 +1462,11 @@ impl DeviceBase {
             address_bits: self.address_bits(),
             float_controls: spirv_float_controls,
             flat_generic: self.generic_address_space_supported(),
+            max_workgroup_invocations: if self.wg_collectives_supported() {
+                self.max_threads_per_block() as u32
+            } else {
+                0
+            },
         }
     }
 

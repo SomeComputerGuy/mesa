@@ -966,11 +966,23 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
    c->getPreprocessorOpts().addMacroDef("cl_khr_expect_assume=1");
 
    bool needs_opencl_c_h = false;
+   if (args->features.atomic_order_acq_rel) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_atomic_order_acq_rel");
+   }
    if (args->features.atomic_order_seq_cst) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_atomic_order_seq_cst");
    }
    if (args->features.atomic_scope_device) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_atomic_scope_device");
+   }
+   if (args->features.atomic_scope_all_devices) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_atomic_scope_all_devices");
+   }
+   if (args->features.program_scope_global_variables) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_program_scope_global_variables");
+   }
+   if (args->features.work_group_collective_functions) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_work_group_collective_functions");
    }
    if (args->features.extended_bit_ops) {
       c->getPreprocessorOpts().addMacroDef("cl_khr_extended_bit_ops=1");

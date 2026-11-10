@@ -6158,6 +6158,10 @@ typedef struct nir_lower_compute_system_values_options {
     * and compute it quickly. Fall back to slow computation if not.
     */
    bool shortcut_1d_workgroup_id : 1;
+   /* load_enqueued_workgroup_size is lowered by the caller (OpenCL non-uniform
+    * work-groups); otherwise it becomes load_workgroup_size.
+    */
+   bool has_enqueued_workgroup_size : 1;
    uint32_t num_workgroups[3]; /* Compile-time-known dispatch sizes, or 0 if unknown. */
 } nir_lower_compute_system_values_options;
 

@@ -71,6 +71,14 @@ struct spirv_to_nir_options {
    /* Whether or not printf is supported */
    bool printf;
 
+   /* OpenCL: the largest number of invocations of a workgroup. When non-zero,
+    * the work-group scope OpGroup* collectives (work_group_reduce/scan/
+    * broadcast/all/any) become the workgroup_* intrinsics, which the frontend
+    * lowers for workgroups of up to this size. When zero they are subgroup
+    * operations as before.
+    */
+   uint32_t cl_max_workgroup_invocations;
+
    /* Whether or not the driver wants consume debug information (Debugging purposes). */
    bool debug_info;
 
