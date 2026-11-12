@@ -1031,6 +1031,45 @@ GENX(jm_launch_draw)(struct panfrost_batch *batch,
 }
 
 #if PAN_ARCH >= 6 && PAN_ARCH <= 7
+/*
+ * Vertex job of a draw without its tiler job: runs a (non-IDVS) vertex
+ * program for its memory side effects only, when rasterization is discarded.
+ */
+void
+GENX(jm_launch_vertex_only)(struct panfrost_batch *batch,
+                            const struct pipe_draw_info *info,
+                            unsigned vertex_count)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   assert(!ctx->prog[MESA_SHADER_VERTEX]->info.vs.idvs);
+
+   struct mali_invocation_packed invocation;
+   if (info->instance_count > 1) {
+      pan_pack_work_groups_compute(&invocation, 1, vertex_count,
+                                   info->instance_count, 1, 1, 1, true, false);
+   } else {
+      pan_pack(&invocation, INVOCATION, cfg) {
+         cfg.invocations = vertex_count - 1;
+         cfg.size_y_shift = 0;
+         cfg.size_z_shift = 0;
+         cfg.workgroups_x_shift = 0;
+         cfg.workgroups_y_shift = 0;
+         cfg.workgroups_z_shift = 32;
+         cfg.thread_group_split = MALI_SPLIT_MIN_EFFICIENT;
+      }
+   }
+
+   struct pan_ptr vertex = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+   if (!vertex.cpu) {
+      mesa_loge("jm_launch_vertex_only failed");
+      return;
+   }
+
+   jm_emit_vertex_job(batch, info, &invocation, vertex.cpu);
+   pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_VERTEX,
+                  batch->vertex_barrier, false, 0, 0, &vertex, false);
+}
+
 /* Compute job of a libpoly program, after every earlier job of the chain */
 void
 GENX(jm_launch_poly_compute)(struct panfrost_batch *batch,

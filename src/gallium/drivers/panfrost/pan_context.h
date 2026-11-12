@@ -459,6 +459,12 @@ struct panfrost_vs_key {
     */
    bool outputs_to_memory;
 
+   /* Compiled without IDVS: the program also runs in a vertex job without a
+    * tiler job (geometry shader rasterization programs writing transform
+    * feedback while rasterization is discarded).
+    */
+   bool no_idvs;
+
    /* Bit mask of varyings in the linked FS that use noperspective
     * interpolation, starting at VARYING_SLOT_VAR0 */
    uint32_t noperspective_varyings;

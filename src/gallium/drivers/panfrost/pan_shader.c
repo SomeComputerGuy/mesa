@@ -136,7 +136,7 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
        * run in a vertex job whose size the GPU patches.
        */
       inputs.no_idvs = s->info.has_transform_feedback_varyings ||
-                       s->info.vs.tes_poly;
+                       s->info.vs.tes_poly || key->vs.no_idvs;
 
       if (s->info.has_transform_feedback_varyings) {
          static const nir_lower_xfb_to_stores_options xfb_options = {

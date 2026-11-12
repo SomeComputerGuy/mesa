@@ -3877,7 +3877,10 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
                                    instances);
    }
 
-   if (skip_rast)
+   /* The rasterization program writes the transform feedback outputs: with
+    * rasterization discarded it still runs, in a vertex job alone.
+    */
+   if (skip_rast && !xfb)
       goto out;
 
    /* 4. The rasterization draw */
@@ -3930,6 +3933,7 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
    struct panfrost_shader_key rast_key = {
       .vs.noperspective_varyings =
          ctx->uncompiled[MESA_SHADER_FRAGMENT]->noperspective_varyings,
+      .vs.no_idvs = skip_rast,
    };
    struct panfrost_compiled_shader *rast =
       panfrost_get_variant(ctx, gs->rast, &rast_key);
@@ -3962,10 +3966,14 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
                                        rast_info.mode == MESA_PRIM_POINTS);
 
    batch->vertex_barrier = true;
-   GENX(jm_launch_draw)(batch, &rast_info, drawid_offset, &rast_draw,
-                        rast_vertices);
+   if (skip_rast) {
+      GENX(jm_launch_vertex_only)(batch, &rast_info, rast_vertices);
+   } else {
+      GENX(jm_launch_draw)(batch, &rast_info, drawid_offset, &rast_draw,
+                           rast_vertices);
+      batch->draw_count++;
+   }
    batch->vertex_barrier = false;
-   batch->draw_count++;
 
 out:
    /* The vertex-stage descriptors now belong to other programs */
