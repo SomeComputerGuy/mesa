@@ -94,6 +94,8 @@ lower_sample_mask_writes(nir_builder *b, nir_intrinsic_instr *intrin,
    return true;
 }
 
+static bool lower_fs_layer_cull(nir_shader *nir);
+
 static void
 panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
                         struct util_debug_callback *dbg,
@@ -164,6 +166,9 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
          NIR_PASS(_, s, nir_lower_clip_fs, key->fs.clip_plane_enable,
                   false, true);
       }
+
+      if (key->fs.layer_cull)
+         NIR_PASS(_, s, lower_fs_layer_cull);
 
       if (key->fs.line_smooth) {
          NIR_PASS(_, s, nir_lower_poly_line_smooth, 16);
@@ -342,8 +347,14 @@ panfrost_build_fs_key(struct panfrost_context *ctx,
          key->line_smooth = rast->line_smooth;
    }
 
-   if (!key->clip_plane_enable)
+   if (!key->clip_plane_enable) {
       key->vs_varying_layout = uncompiled->vs_varying_layout;
+
+      /* Layered draw: cull by the layer varying of the provoking vertex */
+      key->layer_cull = ctx->poly.layer != PAN_LAYER_ALL &&
+                        pan_varying_layout_find_slot(&key->vs_varying_layout,
+                                                     PAN_LAYER_CULL_SLOT);
+   }
 
    if (dev->arch <= 5) {
       u_foreach_bit(i, (nir->info.outputs_read >> FRAG_RESULT_DATA0)) {
@@ -586,7 +597,7 @@ lower_layer_viewport_store(nir_builder *b, nir_intrinsic_instr *intr,
    if (loc == VARYING_SLOT_LAYER) {
       nir_def *v = nir_channel(b, intr->src[0].ssa, nir_intrinsic_component(intr));
       nir_store_var(b, state->layer, nir_u2u32(b, v), 0x1);
-   } else if (loc == VARYING_SLOT_POS && state->layer) {
+   } else if (loc == VARYING_SLOT_POS && state->pos) {
       nir_def *v = intr->src[0].ssa;
       unsigned wrmask = nir_intrinsic_write_mask(intr)
                         << nir_intrinsic_component(intr);
@@ -628,12 +639,23 @@ lower_rast_layer_viewport(nir_shader *nir)
 
    nir_builder b = nir_builder_at(nir_before_impl(impl));
 
-   if (writes_layer && (nir->info.outputs_written & VARYING_BIT_POS)) {
+   /* The layer goes to the fragment shader in a flat varying when a slot is
+    * free, so whole primitives are kept or discarded by the layer of their
+    * provoking vertex. Else vertices are culled by their own layer.
+    */
+   bool layer_varying =
+      !(nir->info.outputs_written & BITFIELD64_BIT(PAN_LAYER_CULL_SLOT));
+
+   if (writes_layer) {
       state.layer =
          nir_local_variable_create(impl, glsl_uint_type(), "layer_cull");
+      nir_store_var(&b, state.layer, nir_imm_int(&b, 0), 0x1);
+   }
+
+   if (writes_layer && !layer_varying &&
+       (nir->info.outputs_written & VARYING_BIT_POS)) {
       state.pos =
          nir_local_variable_create(impl, glsl_vec4_type(), "pos_cull");
-      nir_store_var(&b, state.layer, nir_imm_int(&b, 0), 0x1);
       nir_store_var(&b, state.pos, nir_imm_vec4(&b, 0, 0, 0, 1), 0xf);
    }
 
@@ -662,8 +684,43 @@ lower_rast_layer_viewport(nir_shader *nir)
                           nir_intrinsic_io_semantics(state.pos_store));
    }
 
+   if (writes_layer && layer_varying) {
+      b.cursor = nir_after_impl(impl);
+      nir_store_output(
+         &b, nir_load_var(&b, state.layer), nir_imm_int(&b, 0),
+         .base = util_bitcount64(nir->info.outputs_written &
+                                 BITFIELD64_MASK(PAN_LAYER_CULL_SLOT)),
+         .write_mask = 0x1, .component = 0, .src_type = nir_type_uint32,
+         .io_semantics.location = PAN_LAYER_CULL_SLOT,
+         .io_semantics.num_slots = 1);
+      nir->info.outputs_written |= BITFIELD64_BIT(PAN_LAYER_CULL_SLOT);
+   }
+
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    nir->info.outputs_written &= ~(VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
+   return true;
+}
+
+/* Layered draws: discard the fragments of primitives of other layers */
+static bool
+lower_fs_layer_cull(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   nir_def *layer = nir_load_input(
+      &b, 1, 32, nir_imm_int(&b, 0),
+      .base = util_bitcount64(nir->info.inputs_read &
+                              BITFIELD64_MASK(PAN_LAYER_CULL_SLOT)),
+      .component = 0, .dest_type = nir_type_uint32,
+      .io_semantics.location = PAN_LAYER_CULL_SLOT,
+      .io_semantics.num_slots = 1);
+   nir_def *ref = nir_load_draw_layer_pan(&b);
+   nir_demote_if(&b, nir_ine(&b, layer, ref));
+
+   nir->info.inputs_read |= BITFIELD64_BIT(PAN_LAYER_CULL_SLOT);
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_none);
    return true;
 }
 
@@ -784,9 +841,24 @@ panfrost_keep_outputs_nir(void *mem_ctx, const nir_shader *nir)
    shell->info.name = NULL;
    shell->info.label = NULL;
 
-   nir_foreach_shader_out_variable(var, nir)
-      nir_shader_add_variable(shell, nir_variable_clone(var, shell));
+   /* Lowered I/O has no variables left: one per written slot, 4 components
+    * (the geometry stages copy whole slots).
+    */
+   u_foreach_bit64(slot, nir->info.outputs_written) {
+      const struct glsl_type *type = glsl_vec4_type();
 
+      if (slot == VARYING_SLOT_PSIZ)
+         type = glsl_float_type();
+      else if (slot == VARYING_SLOT_LAYER || slot == VARYING_SLOT_VIEWPORT ||
+               slot == VARYING_SLOT_PRIMITIVE_ID)
+         type = glsl_int_type();
+
+      nir_variable *var = nir_variable_create(shell, nir_var_shader_out, type,
+                                              gl_varying_slot_name_for_stage(
+                                                 slot, nir->info.stage));
+      var->data.location = slot;
+      var->data.driver_location = slot;
+   }
    if (nir->xfb_info) {
       size_t size = nir_xfb_info_size(nir->xfb_info->output_count);
       shell->xfb_info = ralloc_memdup(shell, nir->xfb_info, size);

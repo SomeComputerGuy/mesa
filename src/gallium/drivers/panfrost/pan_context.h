@@ -436,6 +436,9 @@ struct panfrost_fs_key {
 
    bool line_smooth;
 
+   /* Layered draw on job manager GPUs: discard other layers' primitives */
+   bool layer_cull;
+
    /* The VS varying layout determines how the FS is compiled (LD_VAR vs
     * LD_VAR_BUF and byte offsets). Include the full layout in the key so
     * the disk cache and in-memory variant cache correctly distinguish FS
@@ -754,6 +757,11 @@ nir_shader *panfrost_nir_lower_tes_to_compute(const nir_shader *nir);
 
 /* Geometry and tessellation draws on job manager GPUs (pan_shader.c) */
 #define PAN_LAYER_ALL (~0u)
+
+/* Varying slot of the layer of layered draws (rasterization program to
+ * fragment shader), the last generic slot.
+ */
+#define PAN_LAYER_CULL_SLOT VARYING_SLOT_VAR31
 
 void panfrost_for_each_fb_layer(struct panfrost_context *ctx,
                                 void (*fn)(struct panfrost_context *ctx,
