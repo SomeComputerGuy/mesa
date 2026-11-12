@@ -171,6 +171,9 @@ struct panfrost_batch {
    /* GPU addresses of the vertex and tiler jobs of the last non-IDVS draw */
    uint64_t last_vertex_job, last_tiler_job;
 
+   /* Worst-case size of the tessellation buffers allocated in the batch */
+   size_t tess_worst_B;
+
    /* Set when cycle count is required for this batch. */
    bool need_job_req_cycle_count;
 
