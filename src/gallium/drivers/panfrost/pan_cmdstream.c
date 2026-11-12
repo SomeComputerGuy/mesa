@@ -20,6 +20,7 @@
 #include "util/u_sample_positions.h"
 #include "util/u_vbuf.h"
 #include "util/u_viewport.h"
+#include "xf86drm.h"
 
 #include "decode.h"
 
@@ -3780,11 +3781,51 @@ out:
  * The Arm driver does the same on this GPU: compute jobs between the vertex
  * job and the draw, and a draw whose counts the GPU writes.
  *
- * The CPU does not know the tessellation levels: buffers are sized for the
- * maximum level (64).
+ * The CPU does not know the tessellation levels. Small draws size their
+ * buffers for the maximum level (64), a few hundred kB per patch, within a
+ * memory budget per batch: a draw that does not fit in the batch any more
+ * flushes it and waits for the GPU first. A draw that alone exceeds the
+ * budget runs up to the prefix sum, flushes and waits, and sizes the rest
+ * from the counts the GPU wrote.
  */
 #define PAN_TESS_MAX_POINTS  (65 * 65)
 #define PAN_TESS_MAX_INDICES (6 * 65 * 65)
+#define PAN_TESS_BATCH_BUDGET_B (16u << 20)
+
+static struct panfrost_batch *prepare_draw(struct pipe_context *pipe,
+                                           enum mesa_prim prim);
+
+/* Worst-case size of the per-draw tessellator and varying buffers */
+static size_t
+panfrost_tess_worst_case_B(struct panfrost_context *ctx, unsigned nr_patches)
+{
+   const nir_shader *tes = ctx->uncompiled[MESA_SHADER_TESS_EVAL]->nir;
+
+   /* Domain point, position and one vec4 per output, index */
+   size_t point_B = 8 + 16 + 16 * util_bitcount64(tes->info.outputs_written);
+
+   return (size_t)nr_patches *
+          (PAN_TESS_MAX_POINTS * point_B + PAN_TESS_MAX_INDICES * 4);
+}
+
+/* Submit the batch of the current framebuffer, wait for the GPU and start a
+ * new batch for the draw.
+ */
+static struct panfrost_batch *
+panfrost_tess_flush_and_wait(struct panfrost_context *ctx,
+                             const struct pipe_draw_info *info,
+                             const char *reason)
+{
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+   if (!panfrost_get_fresh_render_batch(ctx, reason))
+      return NULL;
+
+   drmSyncobjWait(panfrost_device_fd(dev), &ctx->syncobj, 1, INT64_MAX, 0,
+                  NULL);
+
+   return prepare_draw(&ctx->base, info->mode);
+}
 
 static enum mesa_prim
 panfrost_tess_output_prim(const struct panfrost_tess_progs *tcs,
@@ -3820,6 +3861,16 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
       return;
 
    unsigned nr_patches = in_patches * info->instance_count;
+
+   size_t worst_B = panfrost_tess_worst_case_B(ctx, nr_patches);
+   bool exact = worst_B > PAN_TESS_BATCH_BUDGET_B;
+
+   if (!exact && batch->tess_worst_B + worst_B > PAN_TESS_BATCH_BUDGET_B) {
+      batch = panfrost_tess_flush_and_wait(ctx, info, "Tessellation memory");
+      if (!batch)
+         return;
+   }
+
    struct panfrost_compiled_shader *saved_vs = ctx->prog[MESA_SHADER_VERTEX];
 
    enum tess_primitive_mode mode = MAX2(tcs->primitive, tes->primitive);
@@ -3831,7 +3882,6 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
       : spacing == TESS_SPACING_FRACTIONAL_ODD ? PIPE_TESS_SPACING_FRACTIONAL_ODD
                                                : PIPE_TESS_SPACING_FRACTIONAL_EVEN;
 
-   struct pan_pool *gpu_pool = &batch->invisible_pool.base;
    size_t max_points = (size_t)nr_patches * PAN_TESS_MAX_POINTS;
    size_t max_indices = (size_t)nr_patches * PAN_TESS_MAX_INDICES;
 
@@ -3856,14 +3906,44 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
    memcpy(tp.tess_level_inner_default, ctx->default_inner_level,
           sizeof(ctx->default_inner_level));
 
-   tp.tcs_buffer =
-      pan_pool_alloc_aligned(gpu_pool, nr_patches * tcs->output_stride, 64).gpu;
-   tp.coord_allocs = pan_pool_alloc_aligned(gpu_pool, nr_patches * 4, 64).gpu;
-   tp.counts = pan_pool_alloc_aligned(gpu_pool, nr_patches * 4, 64).gpu;
-   tp.point_counts = pan_pool_alloc_aligned(gpu_pool, nr_patches * 4, 64).gpu;
-   tp.patch_coord_buffer =
-      pan_pool_alloc_aligned(gpu_pool, max_points * 8, 64).gpu;
-   tp.index_buffer = pan_pool_alloc_aligned(gpu_pool, max_indices * 4, 64).gpu;
+   /* The control shader outputs and the per-patch counts. In the exact
+    * path they outlive the batch of the first half of the draw.
+    */
+   size_t tcs_B = ALIGN_POT((size_t)nr_patches * tcs->output_stride, 64);
+   size_t count_B = ALIGN_POT((size_t)nr_patches * 4, 64);
+   struct panfrost_bo *counts_bo = NULL;
+   uint64_t counts_gpu;
+
+   if (exact) {
+      struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+      counts_bo = panfrost_bo_create(dev, MAX2(tcs_B + 3 * count_B, 64), 0,
+                                     "Tessellation counts");
+      if (!counts_bo) {
+         mesa_loge("failed to allocate the tessellation counts");
+         return;
+      }
+
+      panfrost_batch_write_bo(batch, counts_bo);
+      counts_gpu = counts_bo->ptr.gpu;
+   } else {
+      counts_gpu = pan_pool_alloc_aligned(&batch->invisible_pool.base,
+                                          MAX2(tcs_B + 3 * count_B, 64), 64)
+                      .gpu;
+      batch->tess_worst_B += worst_B;
+   }
+
+   tp.tcs_buffer = counts_gpu;
+   tp.coord_allocs = counts_gpu + tcs_B;
+   tp.counts = counts_gpu + tcs_B + count_B;
+   tp.point_counts = counts_gpu + tcs_B + 2 * count_B;
+
+   if (!exact) {
+      tp.patch_coord_buffer = pan_pool_alloc_aligned(
+         &batch->invisible_pool.base, max_points * 8, 64).gpu;
+      tp.index_buffer = pan_pool_alloc_aligned(
+         &batch->invisible_pool.base, max_indices * 4, 64).gpu;
+   }
 
    ctx->poly.tp = pan_pool_upload_aligned(&batch->pool.base, &tp, sizeof(tp), 64);
    ctx->poly.gp = 0;
@@ -3885,15 +3965,51 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
    struct pan_ptr jobs = pan_pool_alloc_aligned(&batch->pool.base, 16, 8);
    struct panlib_precomp_grid tess_grid = panlib_1d(nr_patches);
 
+   /* Zero job addresses: the prefix sum patches no job */
+   memset(jobs.cpu, 0, 16);
+
    panlib_tessellate(batch, tess_grid, PANLIB_BARRIER_JM_BARRIER, ctx->poly.tp,
                      mode, POLY_TESS_MODE_COUNT);
    panlib_tess_prefix_sum_patch(batch, panlib_1d(1),
                                 PANLIB_BARRIER_JM_BARRIER |
                                    PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
                                 ctx->poly.tp, jobs.gpu);
+   batch->compute_count += 2;
+
+   if (exact) {
+      /* Read the totals back and size the rest of the draw from them */
+      batch = panfrost_tess_flush_and_wait(ctx, info, "Tessellation counts");
+      if (!batch) {
+         panfrost_bo_unreference(counts_bo);
+         goto out;
+      }
+
+      const uint8_t *cpu = counts_bo->ptr.cpu;
+      const uint32_t *counts = (const uint32_t *)(cpu + tcs_B + count_B);
+      const uint32_t *point_counts =
+         (const uint32_t *)(cpu + tcs_B + 2 * count_B);
+      max_indices = counts[nr_patches - 1];
+      max_points = point_counts[nr_patches - 1];
+
+      if (max_indices == 0 || max_points == 0) {
+         panfrost_bo_unreference(counts_bo);
+         goto out;
+      }
+
+      panfrost_batch_write_bo(batch, counts_bo);
+      panfrost_bo_unreference(counts_bo);
+
+      tp.patch_coord_buffer = pan_pool_alloc_aligned(
+         &batch->invisible_pool.base, max_points * 8, 64).gpu;
+      tp.index_buffer = pan_pool_alloc_aligned(
+         &batch->invisible_pool.base, max_indices * 4, 64).gpu;
+      ctx->poly.tp =
+         pan_pool_upload_aligned(&batch->pool.base, &tp, sizeof(tp), 64);
+   }
+
    panlib_tessellate(batch, tess_grid, PANLIB_BARRIER_JM_BARRIER, ctx->poly.tp,
                      mode, POLY_TESS_MODE_WITH_COUNTS);
-   batch->compute_count += 3;
+   batch->compute_count++;
 
    /* 4. The rasterization draw, its counts written by the GPU */
    struct pipe_draw_info rast_info = {
@@ -3938,10 +4054,16 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
    batch->vertex_barrier = false;
    batch->draw_count++;
 
-   uint64_t *job_ptrs = jobs.cpu;
-   job_ptrs[0] = batch->last_vertex_job;
-   job_ptrs[1] = batch->last_tiler_job;
+   /* The prefix sum writes the GPU counts into the jobs. In the exact path,
+    * the CPU did.
+    */
+   if (!exact) {
+      uint64_t *job_ptrs = jobs.cpu;
+      job_ptrs[0] = batch->last_vertex_job;
+      job_ptrs[1] = batch->last_tiler_job;
+   }
 
+out:
    ctx->prog[MESA_SHADER_VERTEX] = saved_vs;
    ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_VERTEX;
    ctx->dirty_shader[MESA_SHADER_VERTEX] = ~0;
@@ -4187,6 +4309,11 @@ panfrost_multi_draw_direct(struct pipe_context *pipe,
 
    for (unsigned i = 0; i < num_draws; i++) {
       panfrost_single_draw_direct(batch, &tmp_info, drawid, &draws[i]);
+
+      /* Tessellation draws may have flushed the batch */
+      if (!ctx->batch[PANFROST_BATCH_RENDER])
+         return;
+      batch = ctx->batch[PANFROST_BATCH_RENDER];
 
       if (tmp_info.increment_draw_id) {
          ctx->dirty |= PAN_DIRTY_DRAWID;

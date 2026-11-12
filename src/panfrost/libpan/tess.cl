@@ -59,6 +59,10 @@ panlib_tess_prefix_sum_patch(global struct poly_tess_params *p,
    uint vertex_count = max(points, 1u);
    uint index_count = max(indices, 1u);
 
+   /* No jobs: the CPU reads the counts back and sizes the draw */
+   if (!jobs[0])
+      return;
+
    if (indices == 0)
       p->index_buffer[0] = ~0u;
 
