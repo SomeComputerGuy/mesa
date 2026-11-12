@@ -8,6 +8,7 @@
  */
 
 #include "pan_shader.h"
+#include <math.h>
 #include "nir/tgsi_to_nir.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
@@ -558,21 +559,132 @@ panfrost_collect_vs_varying_layout(struct panfrost_device *dev,
    pan_build_varying_layout_compact(varying_layout, nir, dev->arch);
 }
 
-/* Job manager GPUs have no per-vertex layer or viewport index: the hardware
+/*
+ * Job manager GPUs have no per-vertex layer or viewport index, so the hardware
  * vertex shader of a geometry shader rasterization draw cannot write them.
+ * Layered framebuffers are drawn once per layer instead (one batch per layer):
+ * vertices whose layer is not the layer being drawn get an infinite position,
+ * which culls their primitives, as panvk does.
  */
+struct layer_cull_state {
+   nir_variable *layer, *pos;
+   nir_intrinsic_instr *pos_store;
+};
+
 static bool
-remove_layer_viewport_store(nir_builder *b, nir_intrinsic_instr *intr,
-                            void *data)
+lower_layer_viewport_store(nir_builder *b, nir_intrinsic_instr *intr,
+                           void *data)
 {
+   struct layer_cull_state *state = data;
+
    if (intr->intrinsic != nir_intrinsic_store_output)
       return false;
 
    gl_varying_slot loc = nir_intrinsic_io_semantics(intr).location;
-   if (loc != VARYING_SLOT_LAYER && loc != VARYING_SLOT_VIEWPORT)
+   b->cursor = nir_before_instr(&intr->instr);
+
+   if (loc == VARYING_SLOT_LAYER) {
+      nir_def *v = nir_channel(b, intr->src[0].ssa, nir_intrinsic_component(intr));
+      nir_store_var(b, state->layer, nir_u2u32(b, v), 0x1);
+   } else if (loc == VARYING_SLOT_POS && state->layer) {
+      nir_def *v = intr->src[0].ssa;
+      unsigned wrmask = nir_intrinsic_write_mask(intr)
+                        << nir_intrinsic_component(intr);
+      if (v->num_components < 4) {
+         nir_def *old = nir_load_var(b, state->pos);
+         nir_def *comps[4];
+         for (unsigned i = 0; i < 4; ++i) {
+            comps[i] = (wrmask & BITFIELD_BIT(i))
+                          ? nir_channel(b, v, i - nir_intrinsic_component(intr))
+                          : nir_channel(b, old, i);
+         }
+         v = nir_vec(b, comps, 4);
+      }
+      nir_store_var(b, state->pos, v, 0xf);
+
+      /* Re-emitted once at the end of the program */
+      if (!state->pos_store) {
+         state->pos_store = intr;
+         nir_instr_remove(&intr->instr);
+         return true;
+      }
+   } else if (loc != VARYING_SLOT_VIEWPORT) {
       return false;
+   }
 
    nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+lower_rast_layer_viewport(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct layer_cull_state state = {0};
+   bool writes_layer = nir->info.outputs_written & VARYING_BIT_LAYER;
+
+   if (!(nir->info.outputs_written & (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)))
+      return false;
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   if (writes_layer && (nir->info.outputs_written & VARYING_BIT_POS)) {
+      state.layer =
+         nir_local_variable_create(impl, glsl_uint_type(), "layer_cull");
+      state.pos =
+         nir_local_variable_create(impl, glsl_vec4_type(), "pos_cull");
+      nir_store_var(&b, state.layer, nir_imm_int(&b, 0), 0x1);
+      nir_store_var(&b, state.pos, nir_imm_vec4(&b, 0, 0, 0, 1), 0xf);
+   }
+
+   nir_shader_intrinsics_pass(nir, lower_layer_viewport_store,
+                              nir_metadata_none, &state);
+
+   if (state.pos_store) {
+      b.cursor = nir_after_impl(impl);
+
+      nir_def *layer = nir_load_var(&b, state.layer);
+      nir_def *ref = nir_load_draw_layer_pan(&b);
+      nir_def *keep = nir_ior(&b, nir_ieq(&b, layer, ref),
+                              nir_ieq_imm(&b, ref, PAN_LAYER_ALL));
+      nir_def *inf = nir_imm_vec4(&b, INFINITY, INFINITY, INFINITY, 1.0f);
+      nir_def *pos = nir_bcsel(&b, keep, nir_load_var(&b, state.pos), inf);
+
+      if (state.pos_store->src[0].ssa->bit_size == 16)
+         pos = nir_f2f16(&b, pos);
+
+      nir_store_output(&b, pos, nir_imm_int(&b, 0),
+                       .base = nir_intrinsic_base(state.pos_store),
+                       .write_mask = 0xf,
+                       .component = 0,
+                       .src_type = nir_intrinsic_src_type(state.pos_store),
+                       .io_semantics =
+                          nir_intrinsic_io_semantics(state.pos_store));
+   }
+
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   nir->info.outputs_written &= ~(VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
+   return true;
+}
+
+/* The fragment shader reads the layer drawn, not a varying (see above) */
+static bool
+lower_fs_layer_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_input &&
+       intr->intrinsic != nir_intrinsic_load_interpolated_input)
+      return false;
+
+   if (nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_LAYER)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *ref = nir_load_draw_layer_pan(b);
+   nir_def *layer =
+      nir_bcsel(b, nir_ieq_imm(b, ref, PAN_LAYER_ALL), nir_imm_int(b, 0), ref);
+   layer = nir_replicate(b, nir_u2uN(b, layer, intr->def.bit_size),
+                         intr->def.num_components);
+   nir_def_replace(&intr->def, layer);
    return true;
 }
 
@@ -583,13 +695,8 @@ panfrost_create_internal_shader(struct panfrost_context *ctx, nir_shader *nir)
    struct panfrost_device *dev = pan_device(ctx->base.screen);
 
    if (nir->info.stage == MESA_SHADER_VERTEX) {
-      if (dev->arch < 9) {
-         if (nir_shader_intrinsics_pass(nir, remove_layer_viewport_store,
-                                        nir_metadata_control_flow, NULL)) {
-            nir->info.outputs_written &=
-               ~(VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
-         }
-      }
+      if (dev->arch < 9)
+         lower_rast_layer_viewport(nir);
 
       pan_preprocess_nir(nir, dev->arch);
    }
@@ -825,6 +932,13 @@ panfrost_create_shader_state(struct pipe_context *pctx,
    }
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      if (dev->arch >= 6 && dev->arch <= 7 &&
+          (nir->info.inputs_read & VARYING_BIT_LAYER)) {
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fs_layer_input,
+                  nir_metadata_control_flow, NULL);
+         nir->info.inputs_read &= ~VARYING_BIT_LAYER;
+      }
+
       so->noperspective_varyings =
          pan_nir_collect_noperspective_varyings_fs(nir);
 

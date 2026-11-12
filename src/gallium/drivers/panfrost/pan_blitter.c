@@ -7,6 +7,7 @@
 
 #include "util/format/u_format.h"
 #include "util/u_gen_mipmap.h"
+#include "util/u_framebuffer.h"
 #include "util/u_surface.h"
 #include "pan_blitter.h"
 #include "pan_context.h"
@@ -257,6 +258,27 @@ panfrost_blitter_try_batch_clear(struct panfrost_context *ctx,
    return false;
 }
 
+struct panfrost_layered_clear {
+   unsigned buffers;
+   uint32_t color_clear_mask;
+   uint8_t stencil_clear_mask;
+   const struct pipe_scissor_state *scissor_state;
+   const union pipe_color_union *color;
+   double depth;
+   unsigned stencil;
+};
+
+static void
+panfrost_layered_clear_one(struct panfrost_context *ctx, unsigned layer,
+                           void *data)
+{
+   struct panfrost_layered_clear *c = data;
+
+   panfrost_blitter_clear(&ctx->base, c->buffers, c->color_clear_mask,
+                          c->stencil_clear_mask, c->scissor_state, c->color,
+                          c->depth, c->stencil);
+}
+
 void
 panfrost_blitter_clear(struct pipe_context *pipe, unsigned buffers,
                        uint32_t color_clear_mask, uint8_t stencil_clear_mask,
@@ -273,6 +295,19 @@ panfrost_blitter_clear(struct pipe_context *pipe, unsigned buffers,
 
    if (!panfrost_render_condition_check(ctx))
       return;
+
+   /* Job manager GPUs render one layer per batch: clear each layer */
+   struct panfrost_device *dev = pan_device(pipe->screen);
+   if (dev->arch >= 6 && dev->arch <= 7 &&
+       util_framebuffer_get_num_layers(&ctx->pipe_framebuffer) > 1) {
+      struct panfrost_layered_clear c = {
+         buffers, color_clear_mask, stencil_clear_mask, scissor_state,
+         color, depth, stencil,
+      };
+
+      panfrost_for_each_fb_layer(ctx, panfrost_layered_clear_one, &c);
+      return;
+   }
 
    if (panfrost_blitter_try_batch_clear(ctx, buffers, color, depth, stencil))
       return;

@@ -25,6 +25,7 @@
 #include "util/u_prim.h"
 #include "util/u_prim_restart.h"
 #include "util/u_printf.h"
+#include "util/u_framebuffer.h"
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
 #include "util/u_vbuf.h"
@@ -431,6 +432,48 @@ panfrost_set_framebuffer_state(struct pipe_context *pctx,
       if (ctx->pipe_framebuffer.cbufs[i].texture)
          ctx->fb_rt_mask |= BITFIELD_BIT(i);
    }
+}
+
+/* Layered framebuffers on job manager GPUs (see panfrost_draw_vbo) */
+void
+panfrost_for_each_fb_layer(struct panfrost_context *ctx,
+                           void (*fn)(struct panfrost_context *ctx,
+                                      unsigned layer, void *data),
+                           void *data)
+{
+   struct pipe_context *pipe = &ctx->base;
+   struct pipe_framebuffer_state saved = {0}, fb;
+   unsigned layers = util_framebuffer_get_num_layers(&ctx->pipe_framebuffer);
+
+   util_copy_framebuffer_state(&saved, &ctx->pipe_framebuffer);
+
+   for (unsigned l = 0; l < layers; ++l) {
+      fb = saved;
+
+      for (unsigned i = 0; i < fb.nr_cbufs; ++i) {
+         struct pipe_surface *surf = &fb.cbufs[i];
+         if (surf->texture && surf->first_layer + l <= surf->last_layer)
+            surf->first_layer = surf->last_layer = surf->first_layer + l;
+      }
+
+      if (fb.zsbuf.texture &&
+          fb.zsbuf.first_layer + l <= fb.zsbuf.last_layer)
+         fb.zsbuf.first_layer = fb.zsbuf.last_layer = fb.zsbuf.first_layer + l;
+
+      fb.layers = 1;
+      pipe->set_framebuffer_state(pipe, &fb);
+      ctx->dirty = ~0;
+      for (unsigned i = 0; i < MESA_SHADER_STAGES; ++i)
+         ctx->dirty_shader[i] = ~0;
+
+      fn(ctx, l, data);
+   }
+
+   pipe->set_framebuffer_state(pipe, &saved);
+   util_unreference_framebuffer_state(&saved);
+   ctx->dirty = ~0;
+   for (unsigned i = 0; i < MESA_SHADER_STAGES; ++i)
+      ctx->dirty_shader[i] = ~0;
 }
 
 static void
@@ -1197,6 +1240,7 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    }
 
    ctx->blitter = panfrost_blitter_create(gallium);
+   ctx->poly.layer = PAN_LAYER_ALL;
 
    ctx->writers = _mesa_hash_table_create(gallium, _mesa_hash_pointer,
                                           _mesa_key_pointer_equal);

@@ -12,6 +12,7 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_state.h"
 #include "util/macros.h"
+#include "util/u_framebuffer.h"
 #include "util/u_draw.h"
 #include "util/u_helpers.h"
 #include "util/u_memory.h"
@@ -1448,6 +1449,9 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
             break;
          case PAN_SYSVAL_POLY_STAT_SINK:
             uniforms[i].du[0] = batch->ctx->poly.stat_sink;
+            break;
+         case PAN_SYSVAL_POLY_LAYER:
+            uniforms[i].u[0] = batch->ctx->poly.layer;
             break;
          default:
             UNREACHABLE("invalid poly sysval");
@@ -3707,8 +3711,11 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
    if (!prims)
       return;
 
-   bool xfb = gs->xfb && ctx->streamout.num_targets > 0;
-   bool queries = ctx->nr_prim_queries > 0 && ctx->active_queries;
+   /* A layered draw repeated for another layer counts and writes nothing */
+   bool xfb = gs->xfb && ctx->streamout.num_targets > 0 &&
+              !ctx->poly.layer_repeat;
+   bool queries = ctx->nr_prim_queries > 0 && ctx->active_queries &&
+                  !ctx->poly.layer_repeat;
    bool skip_rast = panfrost_poly_skip_rasterization(batch);
 
    /* Geometry shaders have no other side effects in GLES */
@@ -4578,6 +4585,46 @@ panfrost_multi_draw_direct(struct pipe_context *pipe,
 
 #if PAN_ARCH >= 6 && PAN_ARCH <= 7
 /*
+ * Layered rendering: job manager GPUs render one framebuffer layer per batch
+ * and have no per-primitive layer select. A draw whose geometry shader writes
+ * gl_Layer to a layered framebuffer is repeated in the batch of each layer,
+ * culling the primitives of the other layers (see lower_rast_layer_viewport).
+ */
+static unsigned
+panfrost_layered_draw_layers(struct panfrost_context *ctx)
+{
+   struct panfrost_uncompiled_shader *gs = ctx->uncompiled[MESA_SHADER_GEOMETRY];
+
+   if (!gs || !(gs->nir->info.outputs_written & VARYING_BIT_LAYER))
+      return 0;
+
+   unsigned layers = util_framebuffer_get_num_layers(&ctx->pipe_framebuffer);
+   return layers > 1 ? layers : 0;
+}
+
+struct panfrost_layered_draw {
+   const struct pipe_draw_info *info;
+   unsigned drawid_offset;
+   const struct pipe_draw_indirect_info *indirect;
+   const struct pipe_draw_start_count_bias *draws;
+   unsigned num_draws;
+};
+
+static void
+panfrost_layered_draw_one(struct panfrost_context *ctx, unsigned layer,
+                          void *data)
+{
+   struct panfrost_layered_draw *d = data;
+
+   ctx->poly.layer = layer;
+   ctx->poly.layer_repeat = layer > 0;
+   ctx->base.draw_vbo(&ctx->base, d->info, d->drawid_offset, d->indirect,
+                      d->draws, d->num_draws);
+   ctx->poly.layer = PAN_LAYER_ALL;
+   ctx->poly.layer_repeat = false;
+}
+
+/*
  * Draws that need a geometry shader stage when none is bound: adjacency
  * primitives (only a geometry shader sees them), and transform feedback and
  * primitive queries after tessellation (the geometry shader path counts and
@@ -4669,6 +4716,16 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    ctx->draw_calls++;
 
 #if PAN_ARCH >= 6 && PAN_ARCH <= 7
+   if (panfrost_layered_draw_layers(ctx)) {
+      struct panfrost_layered_draw d = {
+         info, drawid_offset, indirect, draws, num_draws,
+      };
+
+      perf_debug(ctx, "Layered draw repeated per layer");
+      panfrost_for_each_fb_layer(ctx, panfrost_layered_draw_one, &d);
+      return;
+   }
+
    if (panfrost_needs_passthrough_gs(ctx, info)) {
       panfrost_draw_passthrough_gs(pipe, info, drawid_offset, indirect, draws,
                                    num_draws);

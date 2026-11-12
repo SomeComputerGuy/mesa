@@ -297,6 +297,17 @@ struct panfrost_context {
       uint64_t stat_sink;
 
       uint32_t provoking_last;
+
+      /* Layered rendering: the framebuffer layer the draw being emitted
+       * renders to, PAN_LAYER_ALL when the framebuffer is not layered.
+       * Primitives of other layers are culled.
+       */
+      uint32_t layer;
+
+      /* Set while a layered draw is repeated for the layers after the
+       * first: transform feedback and queries were done by the first.
+       */
+      bool layer_repeat;
    } poly;
 };
 
@@ -365,6 +376,7 @@ enum {
    PAN_SYSVAL_POLY_SINK = 3,
    PAN_SYSVAL_POLY_PROVOKING_LAST = 4,
    PAN_SYSVAL_POLY_STAT_SINK = 5,
+   PAN_SYSVAL_POLY_LAYER = 6,
 };
 
 #define PAN_TXS_SYSVAL_ID(texidx, dim, is_array)                               \
@@ -741,6 +753,13 @@ nir_shader *panfrost_nir_lower_tes(const nir_shader *nir);
 nir_shader *panfrost_nir_lower_tes_to_compute(const nir_shader *nir);
 
 /* Geometry and tessellation draws on job manager GPUs (pan_shader.c) */
+#define PAN_LAYER_ALL (~0u)
+
+void panfrost_for_each_fb_layer(struct panfrost_context *ctx,
+                                void (*fn)(struct panfrost_context *ctx,
+                                           unsigned layer, void *data),
+                                void *data);
+
 struct panfrost_uncompiled_shader *
 panfrost_get_tes_compute(struct panfrost_context *ctx,
                          struct panfrost_uncompiled_shader *tes);
