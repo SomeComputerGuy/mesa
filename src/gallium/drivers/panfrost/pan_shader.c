@@ -557,14 +557,41 @@ panfrost_collect_vs_varying_layout(struct panfrost_device *dev,
    pan_build_varying_layout_compact(varying_layout, nir, dev->arch);
 }
 
+/* Job manager GPUs have no per-vertex layer or viewport index: the hardware
+ * vertex shader of a geometry shader rasterization draw cannot write them.
+ */
+static bool
+remove_layer_viewport_store(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   gl_varying_slot loc = nir_intrinsic_io_semantics(intr).location;
+   if (loc != VARYING_SLOT_LAYER && loc != VARYING_SLOT_VIEWPORT)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 /* CSO for a program derived from an application shader (libpoly lowering) */
 static struct panfrost_uncompiled_shader *
 panfrost_create_internal_shader(struct panfrost_context *ctx, nir_shader *nir)
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
 
-   if (nir->info.stage == MESA_SHADER_VERTEX)
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      if (dev->arch < 9) {
+         if (nir_shader_intrinsics_pass(nir, remove_layer_viewport_store,
+                                        nir_metadata_control_flow, NULL)) {
+            nir->info.outputs_written &=
+               ~(VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
+         }
+      }
+
       pan_preprocess_nir(nir, dev->arch);
+   }
 
    /* Programs built from scratch by libpoly have no default uniform block */
    nir->info.first_ubo_is_default_ubo = true;
