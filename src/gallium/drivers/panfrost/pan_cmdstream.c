@@ -4319,8 +4319,10 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
                                        out_prim == MESA_PRIM_POINTS);
 
    batch->vertex_barrier = true;
+   ctx->poly.flip_front_face = out_prim == MESA_PRIM_TRIANGLES && !tes->ccw;
    GENX(jm_launch_draw)(batch, &rast_info, drawid_offset, &rast_draw,
                         max_points);
+   ctx->poly.flip_front_face = false;
    batch->vertex_barrier = false;
    batch->draw_count++;
 

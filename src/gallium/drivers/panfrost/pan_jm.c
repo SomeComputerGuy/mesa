@@ -527,7 +527,7 @@ jm_emit_tiler_draw(struct mali_draw_packed *out, struct panfrost_batch *batch,
 #else
       cfg.cull_front_face = polygon && (rast->cull_face & PIPE_FACE_FRONT);
       cfg.cull_back_face = polygon && (rast->cull_face & PIPE_FACE_BACK);
-      cfg.front_face_ccw = rast->front_ccw;
+      cfg.front_face_ccw = rast->front_ccw ^ ctx->poly.flip_front_face;
 #endif
 
       if (panfrost_occlusion_query_active(ctx)) {

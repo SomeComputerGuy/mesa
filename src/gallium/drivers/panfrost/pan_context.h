@@ -308,6 +308,12 @@ struct panfrost_context {
        * first: transform feedback and queries were done by the first.
        */
       bool layer_repeat;
+
+      /* Set while the rasterization draw of a tessellation evaluation
+       * shader with clockwise vertex order is emitted: the tessellator
+       * writes counter-clockwise triangles, so the front face flips.
+       */
+      bool flip_front_face;
    } poly;
 };
 
