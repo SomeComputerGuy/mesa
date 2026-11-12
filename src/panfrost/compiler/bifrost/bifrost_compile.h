@@ -165,8 +165,10 @@ bool valhall_can_merge_workgroups(nir_shader *nir);
           nir_divergence_multiple_workgroup_per_compute_subgroup)              \
          : 0,                                                                  \
       .lower_mediump_io = pan_nir_lower_mediump_io,                            \
-      /* Skip unlowering IO to vars */                                         \
-      .io_options = nir_io_has_intrinsics | nir_io_non_interpolated_as_uint,   \
+      /* Skip unlowering IO to vars. Varyings feeding TCS/TES/GS stay out of  \
+       * POS: a TES or GS-copy program writes POS as the real position. */    \
+      .io_options = nir_io_has_intrinsics | nir_io_non_interpolated_as_uint |  \
+                    nir_io_dont_use_pos_for_non_fs_varyings,                   \
       /* Valhall (arch >= 9) fp32 FLOG2/FEXP2 meet the CL ULP budget. */       \
       .has_cl_log2_exp2 = arch >= 9,                                           \
    };
