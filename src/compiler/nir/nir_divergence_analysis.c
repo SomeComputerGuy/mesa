@@ -401,6 +401,14 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_ttmp_register_amd:
    case nir_intrinsic_load_scalar_arg_amd:
    case nir_intrinsic_load_ro_sink_address_poly:
+   case nir_intrinsic_load_vertex_param_buffer_poly:
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+   case nir_intrinsic_load_tess_param_buffer_poly:
+   case nir_intrinsic_load_stat_query_address_poly:
+   case nir_intrinsic_load_input_topology_poly:
+   case nir_intrinsic_load_index_size_poly:
+   case nir_intrinsic_load_vs_outputs_poly:
+   case nir_intrinsic_load_provoking_last:
    case nir_intrinsic_load_frame_arg_pan:
    case nir_intrinsic_load_noperspective_varyings_pan:
    case nir_intrinsic_load_multisampled_pan:
