@@ -197,6 +197,8 @@ read_constant(read_ctx *ctx, void *mem_ctx)
    blob_copy_bytes(ctx->blob, (uint8_t *)c->values, sizeof(c->values));
    c->is_null_constant = memcmp(c->values, zero_vals, sizeof(c->values)) == 0;
    c->num_elements = blob_read_uint32(ctx->blob);
+   /* Pointer targets are resolved by the frontend before serialization. */
+   c->pointer_target = NULL;
 
    if (c->num_elements) {
       c->elements = ralloc_array(c, nir_constant *, c->num_elements);

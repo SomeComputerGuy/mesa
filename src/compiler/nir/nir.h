@@ -464,6 +464,12 @@ struct nir_constant {
 
    /* Array elements / Structure Fields */
    nir_constant **elements;
+
+   /* OpenCL program-scope variable initializers: when set, this scalar is a
+    * pointer to pointer_target plus values[0] bytes. The frontend fills in the
+    * address once it has placed pointer_target.
+    */
+   nir_variable *pointer_target;
 };
 
 /**

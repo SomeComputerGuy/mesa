@@ -807,12 +807,23 @@ vtn_value(struct vtn_builder *b, uint32_t value_id,
    return val;
 }
 
+/* An OpenCL constant pointer to a variable (plus an offset), see
+ * vtn_pointer_constant().
+ */
+static inline bool
+vtn_value_is_constant_address(const struct vtn_value *val)
+{
+   return val->value_type == vtn_value_type_constant &&
+          val->constant->pointer_target;
+}
+
 static inline struct vtn_value *
 vtn_pointer_value(struct vtn_builder *b, uint32_t value_id)
 {
    struct vtn_value *val = vtn_untyped_value(b, value_id);
    if (unlikely(val->value_type != vtn_value_type_pointer &&
-                !val->is_null_constant))
+                !val->is_null_constant &&
+                !vtn_value_is_constant_address(val)))
       _vtn_fail_value_not_pointer(b, value_id);
    return val;
 }
@@ -820,7 +831,7 @@ vtn_pointer_value(struct vtn_builder *b, uint32_t value_id)
 static inline struct vtn_pointer *
 vtn_value_to_pointer(struct vtn_builder *b, struct vtn_value *value)
 {
-   if (value->is_null_constant) {
+   if (value->is_null_constant || vtn_value_is_constant_address(value)) {
       vtn_assert(glsl_type_is_vector_or_scalar(value->type->type));
       nir_def *const_ssa =
          vtn_const_ssa_value(b, value->constant, value->type->type)->def;
@@ -1142,6 +1153,9 @@ vtn_value_is_non_uniform(struct vtn_builder *b, struct vtn_value *value)
 }
 
 nir_constant *vtn_null_constant(struct vtn_builder *b, struct vtn_type *type);
+nir_constant *vtn_pointer_constant(struct vtn_builder *b,
+                                   const struct vtn_type *type,
+                                   nir_variable *target, uint64_t offset);
 struct vtn_ssa_value *vtn_composite_extract(struct vtn_builder *b, struct vtn_ssa_value *src,
                                             const uint32_t *indices, unsigned num_indices);
 struct vtn_ssa_value *vtn_composite_insert(struct vtn_builder *b, struct vtn_ssa_value *src,

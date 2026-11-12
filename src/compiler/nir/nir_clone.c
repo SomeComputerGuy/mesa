@@ -134,6 +134,7 @@ nir_constant_clone(const nir_constant *c, void *mem_ctx)
    memcpy(nc->values, c->values, sizeof(nc->values));
    nc->is_null_constant = c->is_null_constant;
    nc->num_elements = c->num_elements;
+   nc->pointer_target = c->pointer_target;
 
    if (c->num_elements) {
       nc->elements = ralloc_array(nc, nir_constant *, c->num_elements);
@@ -205,6 +206,27 @@ clone_var_list(clone_state *state, struct exec_list *dst,
    foreach_list_typed(nir_variable, var, node, list) {
       nir_variable *nvar = clone_variable(state, var);
       exec_list_push_tail(dst, &nvar->node);
+   }
+}
+
+static void
+remap_constant_pointer_targets(clone_state *state, nir_constant *c)
+{
+   if (c->pointer_target)
+      c->pointer_target = remap_var(state, c->pointer_target);
+   for (unsigned i = 0; i < c->num_elements; i++)
+      remap_constant_pointer_targets(state, c->elements[i]);
+}
+
+/* Addresses of variables in constant initializers (OpenCL program-scope
+ * variables) point to the variables of the new shader.
+ */
+static void
+remap_var_list_pointer_targets(clone_state *state, struct exec_list *list)
+{
+   foreach_list_typed(nir_variable, var, node, list) {
+      if (var->constant_initializer)
+         remap_constant_pointer_targets(state, var->constant_initializer);
    }
 }
 
@@ -712,6 +734,7 @@ clone_function_impl(clone_state *state, const nir_function_impl *fi)
       nfi->preamble = remap_global(state, fi->preamble);
 
    clone_var_list(state, &nfi->locals, &fi->locals);
+   remap_var_list_pointer_targets(state, &nfi->locals);
 
    assert(list_is_empty(&state->phi_srcs));
 
@@ -835,6 +858,7 @@ nir_shader_clone(void *mem_ctx, const nir_shader *s)
    ns->has_debug_info = s->has_debug_info;
 
    clone_var_list(&state, &ns->variables, &s->variables);
+   remap_var_list_pointer_targets(&state, &ns->variables);
 
    /* Go through and clone functions */
    foreach_list_typed(nir_function, fxn, node, &s->functions)

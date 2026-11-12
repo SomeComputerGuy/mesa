@@ -2144,6 +2144,18 @@ vtn_type_is_ray_query(struct vtn_type *type)
    return vtn_type_without_array(type)->base_type == vtn_base_type_ray_query;
 }
 
+static bool
+constant_has_pointer_target(const nir_constant *c)
+{
+   if (c->pointer_target)
+      return true;
+   for (unsigned i = 0; i < c->num_elements; i++) {
+      if (constant_has_pointer_target(c->elements[i]))
+         return true;
+   }
+   return false;
+}
+
 static void
 vtn_create_variable(struct vtn_builder *b, struct vtn_value *val,
                     struct vtn_type *ptr_type, struct vtn_type *data_type,
@@ -2448,12 +2460,31 @@ vtn_create_variable(struct vtn_builder *b, struct vtn_value *val,
             nir_constant_clone(initializer->constant, b->shader);
          break;
       case vtn_value_type_pointer:
-         var->var->pointer_initializer = initializer->pointer->var->var;
+         if (b->options->environment == NIR_SPIRV_OPENCL) {
+            /* Keep the address in the constant initializer, so that it can
+             * sit anywhere in an initialized aggregate as well.
+             */
+            nir_variable *target = initializer->pointer->var->var;
+            var->var->constant_initializer =
+               vtn_pointer_constant(b, initializer->type, target, 0);
+            ralloc_steal(b->shader, var->var->constant_initializer);
+         } else {
+            var->var->pointer_initializer = initializer->pointer->var->var;
+         }
          break;
       default:
          vtn_fail("SPIR-V variable initializer %u must be constant or pointer",
                   vtn_id_for_value(b, initializer));
       }
+
+      /* A __constant variable that holds addresses joins the program-scope
+       * variables, whose addresses the frontend fills in.
+       */
+      if (b->options->environment == NIR_SPIRV_OPENCL &&
+          var->var->data.mode == nir_var_mem_constant &&
+          var->var->constant_initializer &&
+          constant_has_pointer_target(var->var->constant_initializer))
+         var->var->data.mode = nir_var_mem_global;
    }
 
    if (var->mode == vtn_variable_mode_uniform ||
@@ -2834,11 +2865,14 @@ vtn_handle_variables(struct vtn_builder *b, SpvOp opcode,
        */
       /* OpenCL program-scope (CrossWorkgroup) variables are kept in every
        * kernel: the frontend lays all of them out in one buffer of the
-       * program, the same way for each kernel.
+       * program, the same way for each kernel. __constant variables are kept
+       * as well: program-scope initializers may take their address without
+       * the entry point listing them. Unused ones are removed later.
        */
       const bool is_cl_program_var =
          b->options->environment == NIR_SPIRV_OPENCL &&
-         storage_class == SpvStorageClassCrossWorkgroup;
+         (storage_class == SpvStorageClassCrossWorkgroup ||
+          storage_class == SpvStorageClassUniformConstant);
       if (!b->options->create_library && !is_cl_program_var &&
           (is_io || (b->version >= 0x10400 && is_global))) {
          if (!bsearch(&w[2], b->interface_ids, b->interface_ids_count, 4, cmp_uint32_t))

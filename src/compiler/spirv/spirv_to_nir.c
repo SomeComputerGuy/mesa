@@ -542,6 +542,17 @@ vtn_const_ssa_value(struct vtn_builder *b, nir_constant *constant,
                          nir_build_imm(&b->nb, 1, glsl_get_bit_size(element_type),
                                        constant->values));
       vtn_set_ssa_value_var(b, val, mat->var);
+   } else if (glsl_type_is_vector_or_scalar(type) &&
+              constant->pointer_target) {
+      /* The address of a variable plus a byte offset (OpenCL) */
+      vtn_fail_if(!glsl_type_is_scalar(type),
+                  "A constant address must be a scalar");
+      nir_deref_instr *deref =
+         nir_build_deref_var(&b->nb, constant->pointer_target);
+      unsigned bit_size = glsl_get_bit_size(val->type);
+      nir_def *addr = nir_u2uN(&b->nb, &deref->def, bit_size);
+      val->def = nir_iadd(&b->nb, addr,
+                          nir_build_imm(&b->nb, 1, bit_size, constant->values));
    } else if (glsl_type_is_vector_or_scalar(type)) {
       val->def = nir_build_imm(&b->nb, glsl_get_vector_elements(val->type),
                                glsl_get_bit_size(val->type),
@@ -2592,6 +2603,149 @@ vtn_handle_type(struct vtn_builder *b, SpvOp opcode,
    }
 }
 
+/* OpenCL program-scope variables can be initialized with the address of
+ * another variable (plus a byte offset). Such a pointer is a scalar constant
+ * holding the offset, with pointer_target set; the frontend adds the address
+ * of the target once it has placed the variables.
+ */
+nir_constant *
+vtn_pointer_constant(struct vtn_builder *b, const struct vtn_type *type,
+                     nir_variable *target, uint64_t offset)
+{
+   vtn_fail_if(!glsl_type_is_scalar(type->type) ||
+               !glsl_type_is_integer(type->type),
+               "A pointer constant must be a physical pointer or an integer");
+   nir_constant *c = rzalloc(b, nir_constant);
+   c->values[0] = nir_const_value_for_uint(offset,
+                                           glsl_get_bit_size(type->type));
+   c->pointer_target = target;
+
+   /* Program-scope variables share one buffer and one layout in every
+    * kernel of a program: an addressed __constant variable goes there as
+    * well (it stays read-only by the language rules).
+    */
+   if (target && target->data.mode == nir_var_mem_constant)
+      target->data.mode = nir_var_mem_global;
+   return c;
+}
+
+/* Reads the constant pointer w as (target variable, byte offset). target is
+ * NULL for a plain address (NULL pointer or integer).
+ */
+static void
+vtn_get_pointer_constant(struct vtn_builder *b, uint32_t id,
+                         nir_variable **target, uint64_t *offset)
+{
+   struct vtn_value *v = vtn_untyped_value(b, id);
+   switch (v->value_type) {
+   case vtn_value_type_pointer:
+      vtn_fail_if(!v->pointer->var || !v->pointer->var->var ||
+                  v->pointer->deref,
+                  "Constant pointer %u must be the address of a variable", id);
+      *target = v->pointer->var->var;
+      *offset = 0;
+      return;
+   case vtn_value_type_constant:
+      vtn_fail_if(!glsl_type_is_scalar(v->type->type),
+                  "Constant pointer %u must be a scalar", id);
+      *target = v->constant->pointer_target;
+      *offset = nir_const_value_as_uint(v->constant->values[0],
+                                        glsl_get_bit_size(v->type->type));
+      return;
+   case vtn_value_type_undef:
+      *target = NULL;
+      *offset = 0;
+      return;
+   default:
+      vtn_fail("Constant pointer %u must be a variable or a constant", id);
+   }
+}
+
+static uint64_t
+vtn_cl_type_stride(const struct glsl_type *type)
+{
+   unsigned size, align;
+   glsl_get_cl_type_size_align(type, &size, &align);
+   return ALIGN_POT(size, align);
+}
+
+/* OpSpecConstantOp on pointers (OpenCL): casts and access chains of a
+ * variable's address, with the OpenCL layout of the types. Returns false
+ * for opcodes that are not about pointers.
+ */
+static bool
+vtn_handle_pointer_spec_constant_op(struct vtn_builder *b,
+                                    struct vtn_value *val, SpvOp opcode,
+                                    const uint32_t *w, unsigned count)
+{
+   const struct vtn_type *src_type = vtn_get_value_type(b, w[4]);
+   bool is_chain = false, is_ptr_chain = false;
+
+   switch (opcode) {
+   case SpvOpBitcast:
+   case SpvOpConvertPtrToU:
+   case SpvOpConvertUToPtr:
+      /* Only a cast of a variable's address is a relocation. */
+      if (src_type->base_type != vtn_base_type_pointer &&
+          (vtn_untyped_value(b, w[4])->value_type != vtn_value_type_constant ||
+           !vtn_untyped_value(b, w[4])->constant->pointer_target))
+         return false;
+      break;
+   case SpvOpGenericCastToPtr:
+   case SpvOpPtrCastToGeneric:
+      break;
+   case SpvOpPtrAccessChain:
+   case SpvOpInBoundsPtrAccessChain:
+      is_ptr_chain = true;
+      FALLTHROUGH;
+   case SpvOpAccessChain:
+   case SpvOpInBoundsAccessChain:
+      is_chain = true;
+      break;
+   default:
+      return false;
+   }
+
+   nir_variable *target;
+   uint64_t offset;
+   vtn_get_pointer_constant(b, w[4], &target, &offset);
+
+   if (is_chain) {
+      vtn_fail_if(src_type->base_type != vtn_base_type_pointer,
+                  "Base of a constant access chain must be a pointer");
+      const struct glsl_type *type = src_type->pointed->type;
+      unsigned i = 5;
+      if (is_ptr_chain && i < count) {
+         offset += vtn_constant_int(b, w[i]) * vtn_cl_type_stride(type);
+         i++;
+      }
+      for (; i < count; i++) {
+         int64_t idx = vtn_constant_int(b, w[i]);
+         if (glsl_type_is_struct(type)) {
+            unsigned size, align;
+            const struct glsl_type *explicit_type =
+               glsl_get_explicit_type_for_size_align(
+                  type, glsl_get_cl_type_size_align, &size, &align);
+            vtn_fail_if(idx < 0 || idx >= glsl_get_length(type),
+                        "Struct index out of range in a constant chain");
+            offset += glsl_get_struct_field_offset(explicit_type, idx);
+            type = glsl_get_struct_field(type, idx);
+         } else if (glsl_type_is_array_or_matrix(type)) {
+            type = glsl_get_array_element(type);
+            offset += idx * vtn_cl_type_stride(type);
+         } else {
+            vtn_fail_if(!glsl_type_is_vector(type),
+                        "Constant access chain into a scalar");
+            type = glsl_get_scalar_type(type);
+            offset += idx * vtn_cl_type_stride(type);
+         }
+      }
+   }
+
+   val->constant = vtn_pointer_constant(b, val->type, target, offset);
+   return true;
+}
+
 nir_constant *
 vtn_null_constant(struct vtn_builder *b, struct vtn_type *type)
 {
@@ -2829,6 +2983,17 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
                elems[i] = elem_val->constant;
                val->is_undef_constant = val->is_undef_constant &&
                                         elem_val->is_undef_constant;
+            } else if (elem_val->value_type == vtn_value_type_pointer &&
+                       b->options->environment == NIR_SPIRV_OPENCL) {
+               /* The address of a variable (OpenCL program-scope
+                * initializers).
+                */
+               nir_variable *target;
+               uint64_t offset;
+               vtn_get_pointer_constant(b, w[i + 3], &target, &offset);
+               elems[i] = vtn_pointer_constant(b, elem_val->type, target,
+                                               offset);
+               val->is_undef_constant = false;
             } else {
                vtn_fail_if(elem_val->value_type != vtn_value_type_undef,
                            "only constants or undefs allowed for %s",
@@ -2870,6 +3035,9 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
       nir_const_value u32op = nir_const_value_for_uint(w[3], 32);
       vtn_foreach_decoration(b, val, spec_constant_decoration_cb, &u32op);
       SpvOp opcode = u32op.u32;
+      if (b->options->environment == NIR_SPIRV_OPENCL &&
+          vtn_handle_pointer_spec_constant_op(b, val, opcode, w, count))
+         break;
       switch (opcode) {
       case SpvOpBitcast: {
          struct vtn_value *src = &b->values[w[4]];
