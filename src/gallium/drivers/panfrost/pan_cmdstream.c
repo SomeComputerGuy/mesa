@@ -20,7 +20,6 @@
 #include "util/u_sample_positions.h"
 #include "util/u_vbuf.h"
 #include "util/u_viewport.h"
-#include "xf86drm.h"
 
 #include "decode.h"
 
@@ -3778,9 +3777,9 @@ out:
  * The CPU does not know the tessellation levels. Small draws size their
  * buffers for the maximum level (64), a few hundred kB per patch, within a
  * memory budget per batch: a draw that does not fit in the batch any more
- * flushes it and waits for the GPU first. A draw that alone exceeds the
- * budget runs up to the prefix sum, flushes and waits, and sizes the rest
- * from the counts the GPU wrote.
+ * flushes it first. A draw that alone exceeds the budget runs up to the
+ * prefix sum, flushes and waits, and sizes the rest from the counts the GPU
+ * wrote.
  */
 #define PAN_TESS_MAX_POINTS  (65 * 65)
 #define PAN_TESS_MAX_INDICES (6 * 65 * 65)
@@ -3789,34 +3788,34 @@ out:
 static struct panfrost_batch *prepare_draw(struct pipe_context *pipe,
                                            const struct pipe_draw_info *info);
 
-/* Worst-case size of the per-draw tessellator and varying buffers */
+/* Size of the buffers of one domain point: coordinates, position and one
+ * vec4 per output.
+ */
 static size_t
-panfrost_tess_worst_case_B(struct panfrost_context *ctx, unsigned nr_patches)
+panfrost_tess_point_B(struct panfrost_context *ctx)
 {
    const nir_shader *tes = ctx->uncompiled[MESA_SHADER_TESS_EVAL]->nir;
 
-   /* Domain point, position and one vec4 per output, index */
-   size_t point_B = 8 + 16 + 16 * util_bitcount64(tes->info.outputs_written);
-
-   return (size_t)nr_patches *
-          (PAN_TESS_MAX_POINTS * point_B + PAN_TESS_MAX_INDICES * 4);
+   return 8 + 16 + 16 * util_bitcount64(tes->info.outputs_written);
 }
 
-/* Submit the batch of the current framebuffer, wait for the GPU and start a
- * new batch for the draw.
+/* Worst-case size of the per-draw tessellator and varying buffers */
+static size_t
+panfrost_tess_worst_case_B(struct panfrost_context *ctx, size_t nr_patches)
+{
+   return nr_patches * (PAN_TESS_MAX_POINTS * panfrost_tess_point_B(ctx) +
+                        PAN_TESS_MAX_INDICES * 4);
+}
+
+/* Submit the batch of the current framebuffer and start a new batch for the
+ * draw.
  */
 static struct panfrost_batch *
-panfrost_tess_flush_and_wait(struct panfrost_context *ctx,
-                             const struct pipe_draw_info *info,
-                             const char *reason)
+panfrost_tess_next_batch(struct panfrost_context *ctx,
+                         const struct pipe_draw_info *info, const char *reason)
 {
-   struct panfrost_device *dev = pan_device(ctx->base.screen);
-
    if (!panfrost_get_fresh_batch_for_fbo(ctx, reason))
       return NULL;
-
-   drmSyncobjWait(panfrost_device_fd(dev), &ctx->syncobj, 1, INT64_MAX, 0,
-                  NULL);
 
    return prepare_draw(&ctx->base, info);
 }
@@ -3854,13 +3853,19 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
    if (panfrost_poly_skip_rasterization(batch))
       return;
 
-   unsigned nr_patches = in_patches * info->instance_count;
+   uint64_t nr_patches_64 = (uint64_t)in_patches * info->instance_count;
+   if (nr_patches_64 > UINT32_MAX / PAN_TESS_MAX_INDICES) {
+      mesa_loge("tessellation draw of %" PRIu64 " patches is too large",
+                nr_patches_64);
+      return;
+   }
 
+   unsigned nr_patches = nr_patches_64;
    size_t worst_B = panfrost_tess_worst_case_B(ctx, nr_patches);
    bool exact = worst_B > PAN_TESS_BATCH_BUDGET_B;
 
    if (!exact && batch->tess_worst_B + worst_B > PAN_TESS_BATCH_BUDGET_B) {
-      batch = panfrost_tess_flush_and_wait(ctx, info, "Tessellation memory");
+      batch = panfrost_tess_next_batch(ctx, info, "Tessellation memory");
       if (!batch)
          return;
    }
@@ -3937,6 +3942,11 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
          &batch->invisible_pool.base, max_points * 8, 64).gpu;
       tp.index_buffer = pan_pool_alloc_aligned(
          &batch->invisible_pool.base, max_indices * 4, 64).gpu;
+
+      if (!counts_gpu || !tp.patch_coord_buffer || !tp.index_buffer) {
+         mesa_loge("failed to allocate the tessellation buffers");
+         return;
+      }
    }
 
    ctx->poly.tp = pan_pool_upload_aligned(&batch->pool.base, &tp, sizeof(tp), 64);
@@ -3972,8 +3982,14 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
 
    if (exact) {
       /* Read the totals back and size the rest of the draw from them */
-      batch = panfrost_tess_flush_and_wait(ctx, info, "Tessellation counts");
+      batch = panfrost_tess_next_batch(ctx, info, "Tessellation counts");
       if (!batch) {
+         panfrost_bo_unreference(counts_bo);
+         goto out;
+      }
+
+      if (!panfrost_bo_wait(counts_bo, INT64_MAX, true)) {
+         mesa_loge("waiting for the tessellation counts failed");
          panfrost_bo_unreference(counts_bo);
          goto out;
       }
@@ -3982,8 +3998,18 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
       const uint32_t *counts = (const uint32_t *)(cpu + tcs_B + count_B);
       const uint32_t *point_counts =
          (const uint32_t *)(cpu + tcs_B + 2 * count_B);
-      max_indices = counts[nr_patches - 1];
-      max_points = point_counts[nr_patches - 1];
+      size_t indices = counts[nr_patches - 1];
+      size_t points = point_counts[nr_patches - 1];
+
+      if (indices > max_indices || points > max_points) {
+         mesa_loge("invalid tessellation counts: %zu indices, %zu points",
+                   indices, points);
+         panfrost_bo_unreference(counts_bo);
+         goto out;
+      }
+
+      max_indices = indices;
+      max_points = points;
 
       if (max_indices == 0 || max_points == 0) {
          panfrost_bo_unreference(counts_bo);
@@ -3993,10 +4019,25 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
       panfrost_batch_write_bo(batch, counts_bo, MESA_SHADER_TESS_EVAL);
       panfrost_bo_unreference(counts_bo);
 
+      /* The new batch has not seen the 3D state of the draw yet: the
+       * framebuffer masks (or the batch discards its render targets) and
+       * the stack size.
+       */
+      panfrost_batch_adjust_stack_size(batch);
+      panfrost_set_batch_masks_blend(batch);
+      panfrost_set_batch_masks_zs(batch);
+
       tp.patch_coord_buffer = pan_pool_alloc_aligned(
          &batch->invisible_pool.base, max_points * 8, 64).gpu;
       tp.index_buffer = pan_pool_alloc_aligned(
          &batch->invisible_pool.base, max_indices * 4, 64).gpu;
+      if (!tp.patch_coord_buffer || !tp.index_buffer) {
+         mesa_loge("failed to allocate the tessellation buffers");
+         goto out;
+      }
+
+      batch->tess_worst_B +=
+         max_points * panfrost_tess_point_B(ctx) + max_indices * 4;
       ctx->poly.tp =
          pan_pool_upload_aligned(&batch->pool.base, &tp, sizeof(tp), 64);
    }
