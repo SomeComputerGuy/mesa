@@ -1446,6 +1446,9 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
          case PAN_SYSVAL_POLY_PROVOKING_LAST:
             uniforms[i].u[0] = batch->ctx->poly.provoking_last;
             break;
+         case PAN_SYSVAL_POLY_STAT_SINK:
+            uniforms[i].du[0] = batch->ctx->poly.stat_sink;
+            break;
          default:
             UNREACHABLE("invalid poly sysval");
          }
@@ -3598,47 +3601,197 @@ panfrost_poly_run_vs(struct panfrost_batch *batch,
    batch->compute_count++;
 }
 
+static struct panfrost_batch *prepare_draw(struct pipe_context *pipe,
+                                           enum mesa_prim prim);
+
+/* Submit the batch of the current framebuffer and start a new batch for the
+ * draw.
+ */
+static struct panfrost_batch *
+panfrost_poly_next_batch(struct panfrost_context *ctx,
+                         const struct pipe_draw_info *info, const char *reason)
+{
+   if (!panfrost_get_fresh_render_batch(ctx, reason))
+      return NULL;
+
+   return prepare_draw(&ctx->base, info->mode);
+}
+
+/* Counters of a geometry shader draw the CPU reads back: transform feedback
+ * offsets and primitive counts (queries).
+ */
+struct panfrost_poly_counters {
+   uint32_t prims_generated[POLY_MAX_VERTEX_STREAMS];
+   uint32_t xfb_prims[POLY_MAX_VERTEX_STREAMS];
+   uint32_t xfb_overflow[POLY_MAX_VERTEX_STREAMS];
+   uint32_t xfb_any_overflow;
+   uint32_t xfb_offs[POLY_MAX_SO_BUFFERS];
+};
+
+/* Output of the tessellator feeding a geometry shader */
+struct panfrost_gs_tess_input {
+   /* Points, lines or triangles */
+   enum mesa_prim mode;
+
+   /* Number of indices in the tessellator's index buffer */
+   unsigned index_count;
+};
+
+/*
+ * The CPU tracks transform feedback offsets and primitive query counts, but
+ * the GPU computes them for geometry shader draws: submit the draw, wait for
+ * it and read them back. Leaves a new batch for the next draw.
+ */
+static void
+panfrost_poly_read_counters(struct panfrost_context *ctx,
+                            const struct pipe_draw_info *info,
+                            const struct panfrost_gs_progs *gs,
+                            struct panfrost_bo *bo, bool xfb, bool queries)
+{
+   panfrost_poly_next_batch(ctx, info, "Geometry shader counters");
+
+   if (!panfrost_bo_wait(bo, INT64_MAX, true)) {
+      mesa_loge("waiting for the geometry shader counters failed");
+      return;
+   }
+
+   const struct panfrost_poly_counters *c = bo->ptr.cpu;
+
+   if (queries) {
+      ctx->prims_generated += c->prims_generated[0];
+
+      if (xfb)
+         ctx->tf_prims_generated += c->xfb_prims[0];
+   }
+
+   if (xfb) {
+      for (unsigned i = 0; i < ctx->streamout.num_targets; ++i) {
+         struct pipe_stream_output_target *target = ctx->streamout.targets[i];
+
+         if (target && i < POLY_MAX_SO_BUFFERS && gs->xfb_stride[i])
+            pan_so_target(target)->offset = c->xfb_offs[i] / gs->xfb_stride[i];
+      }
+   }
+}
+
+/*
+ * Geometry shaders, lowered with libpoly. A draw becomes:
+ *
+ *    1. the vertex shader (or the evaluation shader after tessellation) as a
+ *       compute job storing its outputs to memory;
+ *    2. for transform feedback and primitive queries: the count program, a
+ *       prefix sum of its counts and the pre-GS program, which sets up the
+ *       transform feedback buffers and counts primitives;
+ *    3. the main geometry program, writing the index buffer of dynamic
+ *       topologies and the transform feedback outputs;
+ *    4. the rasterization draw, re-running the geometry shader per vertex.
+ */
 static void
 panfrost_draw_with_gs(struct panfrost_batch *batch,
                       const struct pipe_draw_info *info, unsigned drawid_offset,
-                      const struct pipe_draw_start_count_bias *draw)
+                      const struct pipe_draw_start_count_bias *draw,
+                      const struct panfrost_gs_tess_input *tess)
 {
    struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
    struct panfrost_gs_progs *gs = ctx->uncompiled[MESA_SHADER_GEOMETRY]->gs;
    const struct poly_gs_info *gsi = &gs->info;
 
    assert(!info->primitive_restart && "lowered in draw_vbo");
 
-   unsigned prims = u_decomposed_prims_for_vertices(info->mode, draw->count);
+   enum mesa_prim in_mode = tess ? tess->mode : info->mode;
+   unsigned in_count = tess ? tess->index_count : draw->count;
+   unsigned instances = tess ? 1 : info->instance_count;
+
+   unsigned prims = u_decomposed_prims_for_vertices(in_mode, in_count);
    if (!prims)
       return;
 
-   /* GLES: rasterizer discard without transform feedback of the geometry
-    * shader leaves nothing observable (no side effects in geometry shaders).
-    * TODO: transform feedback and primitive queries with geometry shaders.
-    */
-   if (panfrost_poly_skip_rasterization(batch))
+   bool xfb = gs->xfb && ctx->streamout.num_targets > 0;
+   bool queries = ctx->nr_prim_queries > 0 && ctx->active_queries;
+   bool skip_rast = panfrost_poly_skip_rasterization(batch);
+
+   /* Geometry shaders have no other side effects in GLES */
+   if (skip_rast && !xfb && !queries)
       return;
 
    struct panfrost_compiled_shader *saved_vs = ctx->prog[MESA_SHADER_VERTEX];
 
    struct poly_geometry_params gp;
    uint32_t wg_gs[3] = {gs->wg_size, 1, 1};
-   poly_geometry_params_init(&gp, info->mode, wg_gs);
-   poly_geometry_params_set_draw(&gp, info->mode, gsi->shape, gsi->max_indices,
-                                 draw->count, info->instance_count);
+   poly_geometry_params_init(&gp, in_mode, wg_gs);
+   poly_geometry_params_set_draw(&gp, in_mode, gsi->shape, gsi->max_indices,
+                                 in_count, instances);
 
    struct pan_ptr sink = pan_pool_alloc_aligned(&batch->pool.base, 64, 64);
+   struct pan_ptr stat_sink = pan_pool_alloc_aligned(&batch->pool.base, 64, 64);
    memset(sink.cpu, 0, 64);
+   memset(stat_sink.cpu, 0, 64);
 
-   for (unsigned i = 0; i < POLY_MAX_VERTEX_STREAMS; ++i) {
-      gp.prims_generated_counter[i] = sink.gpu;
-      gp.xfb_prims_generated_counter[i] = sink.gpu;
-      gp.xfb_overflow[i] = sink.gpu;
+   /* Counters read back by the CPU */
+   struct panfrost_bo *counters = NULL;
+   uint64_t ctr = sink.gpu;
+
+   if (xfb || queries) {
+      counters = panfrost_bo_create(dev, sizeof(struct panfrost_poly_counters),
+                                    0, "Geometry shader counters");
+      if (!counters) {
+         mesa_loge("failed to allocate the geometry shader counters");
+         return;
+      }
+
+      memset(counters->ptr.cpu, 0, sizeof(struct panfrost_poly_counters));
+      panfrost_batch_write_bo(batch, counters);
+      ctr = counters->ptr.gpu;
    }
-   gp.xfb_any_overflow = sink.gpu;
+
+#define CTR(field) (counters ? ctr + offsetof(struct panfrost_poly_counters, field) \
+                             : sink.gpu)
+   for (unsigned i = 0; i < POLY_MAX_VERTEX_STREAMS; ++i) {
+      gp.prims_generated_counter[i] = CTR(prims_generated[i]);
+      gp.xfb_prims_generated_counter[i] = CTR(xfb_prims[i]);
+      gp.xfb_overflow[i] = CTR(xfb_overflow[i]);
+   }
+   gp.xfb_any_overflow = CTR(xfb_any_overflow);
    for (unsigned i = 0; i < POLY_MAX_SO_BUFFERS; ++i)
-      gp.xfb_offs_ptrs[i] = sink.gpu;
+      gp.xfb_offs_ptrs[i] = CTR(xfb_offs[i]);
+#undef CTR
+
+   if (xfb) {
+      struct panfrost_poly_counters *c = counters->ptr.cpu;
+
+      for (unsigned i = 0; i < ctx->streamout.num_targets &&
+                           i < POLY_MAX_SO_BUFFERS; ++i) {
+         struct pipe_stream_output_target *target = ctx->streamout.targets[i];
+         if (!target)
+            continue;
+
+         struct panfrost_resource *rsrc = pan_resource(target->buffer);
+         gp.xfb_base_original[i] = rsrc->plane.base + target->buffer_offset;
+         gp.xfb_size[i] = target->buffer_size;
+         c->xfb_offs[i] = pan_so_target(target)->offset * gs->xfb_stride[i];
+
+         util_range_add(&rsrc->base, &rsrc->valid_buffer_range,
+                        target->buffer_offset,
+                        target->buffer_offset + target->buffer_size);
+         panfrost_batch_write_rsrc(batch, rsrc);
+      }
+   }
+
+   /* Per-primitive counts of the count program, or one set of counters
+    * without a prefix sum. The main program reads them for transform
+    * feedback, so they exist whenever the shader has transform feedback.
+    */
+   gp.count_buffer_stride = gsi->count_words * 4;
+   if (gp.count_buffer_stride) {
+      size_t size = gsi->prefix_sum
+                       ? (size_t)gp.input_primitives * gp.count_buffer_stride
+                       : 16;
+      struct pan_ptr T =
+         pan_pool_alloc_aligned(&batch->pool.base, MAX2(size, 16), 64);
+      memset(T.cpu, 0, MAX2(size, 16));
+      gp.count_buffer = T.gpu;
+   }
 
    unsigned index_count = gp.draw.index_count;
    if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
@@ -3647,27 +3800,80 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
                                 MAX2(index_count * 4, 16), 64).gpu;
    }
 
-   ctx->poly.gp = pan_pool_upload_aligned(&batch->pool.base, &gp, sizeof(gp), 64);
-   ctx->poly.tp = 0;
+   uint64_t gp_gpu =
+      pan_pool_upload_aligned(&batch->pool.base, &gp, sizeof(gp), 64);
+   ctx->poly.gp = gp_gpu;
+   if (!tess)
+      ctx->poly.tp = 0;
    ctx->poly.sink = sink.gpu;
+   ctx->poly.stat_sink = stat_sink.gpu;
    ctx->poly.provoking_last = !ctx->rasterizer->base.flatshade_first;
 
-   /* 1. The vertex shader, storing its outputs to memory */
+   /* 1. The vertex (evaluation) shader, storing its outputs to memory */
    struct poly_vertex_params vp;
-   panfrost_poly_run_vs(batch, info, drawid_offset, draw, &vp);
 
-   /* 2. The main geometry program writes the index buffer */
-   if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+   if (tess) {
+      struct panfrost_uncompiled_shader *tes_so =
+         ctx->uncompiled[MESA_SHADER_TESS_EVAL];
+      struct panfrost_uncompiled_shader *tes_cs =
+         panfrost_get_tes_compute(ctx, tes_so);
+      uint64_t outputs = tes_so->nir->info.outputs_written;
+
+      uint32_t wg[3] = {16, 1, 1};
+      poly_vertex_params_init(&vp, outputs, wg);
+      poly_vertex_params_set_draw(&vp, in_count, 1);
+
+      size_t out_B = poly_tcs_in_size(in_count, outputs);
+      vp.output_buffer =
+         pan_pool_alloc_aligned(&batch->invisible_pool.base,
+                                MAX2(out_B, 16), 64).gpu;
+
+      ctx->poly.vp =
+         pan_pool_upload_aligned(&batch->pool.base, &vp, sizeof(vp), 64);
+
       struct panfrost_shader_key key = {0};
-      struct panfrost_compiled_shader *main_cs =
-         panfrost_get_variant(ctx, gs->main, &key);
-
-      panfrost_launch_poly_compute(batch, MESA_SHADER_GEOMETRY, main_cs,
-                                   gs->wg_size, DIV_ROUND_UP(prims, gs->wg_size),
-                                   info->instance_count);
+      panfrost_launch_poly_compute(batch, MESA_SHADER_TESS_EVAL,
+                                   panfrost_get_variant(ctx, tes_cs, &key),
+                                   16, DIV_ROUND_UP(in_count, 16), 1);
+   } else {
+      panfrost_poly_run_vs(batch, info, drawid_offset, draw, &vp);
    }
 
-   /* 3. The rasterization draw */
+   struct panfrost_shader_key key = {0};
+
+   /* 2. Counts, transform feedback setup and primitive counters */
+   if (xfb || queries) {
+      if (gs->count) {
+         panfrost_launch_poly_compute(
+            batch, MESA_SHADER_GEOMETRY,
+            panfrost_get_variant(ctx, gs->count, &key), gs->wg_size,
+            DIV_ROUND_UP(gp.grid[0], gs->wg_size), instances);
+      }
+
+      if (gsi->prefix_sum && gp.count_buffer_stride) {
+         panlib_gs_prefix_sum(batch, panlib_1d(1), PANLIB_BARRIER_JM_BARRIER,
+                              gp_gpu);
+         batch->compute_count++;
+      }
+
+      panfrost_launch_poly_compute(batch, MESA_SHADER_GEOMETRY,
+                                   panfrost_get_variant(ctx, gs->pre_gs, &key),
+                                   1, 1, 1);
+   }
+
+   /* 3. The main geometry program: index buffer, transform feedback */
+   if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED || xfb) {
+      panfrost_launch_poly_compute(batch, MESA_SHADER_GEOMETRY,
+                                   panfrost_get_variant(ctx, gs->main, &key),
+                                   gs->wg_size,
+                                   DIV_ROUND_UP(gp.grid[0], gs->wg_size),
+                                   instances);
+   }
+
+   if (skip_rast)
+      goto out;
+
+   /* 4. The rasterization draw */
    struct pipe_draw_info rast_info = {
       .mode = gsi->mode,
       .instance_count = 1,
@@ -3682,8 +3888,7 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
       rast_info.restart_index = ~0;
       rast_draw.count = index_count;
       batch->indices = gp.output_index_buffer;
-      rast_vertices = (info->instance_count << gp.primitives_log2) *
-                      gs->vertex_stride;
+      rast_vertices = (instances << gp.primitives_log2) * gs->vertex_stride;
       break;
 
    case POLY_GS_SHAPE_STATIC_INDEXED: {
@@ -3761,6 +3966,13 @@ out:
    ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_VERTEX;
    ctx->dirty_shader[MESA_SHADER_VERTEX] = ~0;
    ctx->dirty_shader[MESA_SHADER_GEOMETRY] = ~0;
+   if (tess)
+      ctx->dirty_shader[MESA_SHADER_TESS_EVAL] = ~0;
+
+   if (counters) {
+      panfrost_poly_read_counters(ctx, info, gs, counters, xfb, queries);
+      panfrost_bo_unreference(counters);
+   }
 }
 #endif
 
@@ -3791,9 +4003,6 @@ out:
 #define PAN_TESS_MAX_INDICES (6 * 65 * 65)
 #define PAN_TESS_BATCH_BUDGET_B (16u << 20)
 
-static struct panfrost_batch *prepare_draw(struct pipe_context *pipe,
-                                           enum mesa_prim prim);
-
 /* Size of the buffers of one domain point: coordinates, position and one
  * vec4 per output.
  */
@@ -3811,19 +4020,6 @@ panfrost_tess_worst_case_B(struct panfrost_context *ctx, size_t nr_patches)
 {
    return nr_patches * (PAN_TESS_MAX_POINTS * panfrost_tess_point_B(ctx) +
                         PAN_TESS_MAX_INDICES * 4);
-}
-
-/* Submit the batch of the current framebuffer and start a new batch for the
- * draw.
- */
-static struct panfrost_batch *
-panfrost_tess_next_batch(struct panfrost_context *ctx,
-                         const struct pipe_draw_info *info, const char *reason)
-{
-   if (!panfrost_get_fresh_render_batch(ctx, reason))
-      return NULL;
-
-   return prepare_draw(&ctx->base, info->mode);
 }
 
 static enum mesa_prim
@@ -3855,8 +4051,11 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
    if (in_patches == 0)
       return;
 
-   /* TODO: transform feedback and primitive queries with tessellation */
-   if (panfrost_poly_skip_rasterization(batch))
+   /* A geometry shader after tessellation (also the passthrough geometry
+    * shader for transform feedback and primitive queries) decides itself.
+    */
+   bool gs = ctx->uncompiled[MESA_SHADER_GEOMETRY] != NULL;
+   if (!gs && panfrost_poly_skip_rasterization(batch))
       return;
 
    uint64_t nr_patches_64 = (uint64_t)in_patches * info->instance_count;
@@ -3868,10 +4067,11 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
 
    unsigned nr_patches = nr_patches_64;
    size_t worst_B = panfrost_tess_worst_case_B(ctx, nr_patches);
-   bool exact = worst_B > PAN_TESS_BATCH_BUDGET_B;
+   /* The geometry shader stage needs the index count on the CPU */
+   bool exact = gs || worst_B > PAN_TESS_BATCH_BUDGET_B;
 
    if (!exact && batch->tess_worst_B + worst_B > PAN_TESS_BATCH_BUDGET_B) {
-      batch = panfrost_tess_next_batch(ctx, info, "Tessellation memory");
+      batch = panfrost_poly_next_batch(ctx, info, "Tessellation memory");
       if (!batch)
          return;
    }
@@ -3988,7 +4188,7 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
 
    if (exact) {
       /* Read the totals back and size the rest of the draw from them */
-      batch = panfrost_tess_next_batch(ctx, info, "Tessellation counts");
+      batch = panfrost_poly_next_batch(ctx, info, "Tessellation counts");
       if (!batch) {
          panfrost_bo_unreference(counts_bo);
          goto out;
@@ -4051,6 +4251,20 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
    panlib_tessellate(batch, tess_grid, PANLIB_BARRIER_JM_BARRIER, ctx->poly.tp,
                      mode, POLY_TESS_MODE_WITH_COUNTS);
    batch->compute_count++;
+
+   if (gs) {
+      /* The evaluation shader runs as a compute job per index, the geometry
+       * shader sees a non-indexed draw of the tessellator's primitives.
+       */
+      const struct panfrost_gs_tess_input in = {
+         .mode = out_prim,
+         .index_count = max_indices,
+      };
+
+      ctx->prog[MESA_SHADER_VERTEX] = saved_vs;
+      panfrost_draw_with_gs(batch, info, drawid_offset, draw, &in);
+      goto out;
+   }
 
    /* 4. The rasterization draw, its counts written by the GPU */
    struct pipe_draw_info rast_info = {
@@ -4126,13 +4340,12 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
 
 #if PAN_ARCH >= 6 && PAN_ARCH <= 7
    if (ctx->uncompiled[MESA_SHADER_TESS_EVAL]) {
-      /* TODO: geometry shaders after tessellation */
       panfrost_draw_with_tess(batch, info, drawid_offset, draw);
       return;
    }
 
    if (ctx->uncompiled[MESA_SHADER_GEOMETRY]) {
-      panfrost_draw_with_gs(batch, info, drawid_offset, draw);
+      panfrost_draw_with_gs(batch, info, drawid_offset, draw, NULL);
       return;
    }
 #endif
@@ -4363,6 +4576,82 @@ panfrost_multi_draw_direct(struct pipe_context *pipe,
    }
 }
 
+#if PAN_ARCH >= 6 && PAN_ARCH <= 7
+/*
+ * Draws that need a geometry shader stage when none is bound: adjacency
+ * primitives (only a geometry shader sees them), and transform feedback and
+ * primitive queries after tessellation (the geometry shader path counts and
+ * writes them on the GPU).
+ */
+static bool
+panfrost_needs_passthrough_gs(struct panfrost_context *ctx,
+                              const struct pipe_draw_info *info)
+{
+   if (ctx->uncompiled[MESA_SHADER_GEOMETRY])
+      return false;
+
+   if (mesa_prim_has_adjacency(info->mode))
+      return true;
+
+   struct panfrost_uncompiled_shader *tes =
+      ctx->uncompiled[MESA_SHADER_TESS_EVAL];
+   if (!tes)
+      return false;
+
+   bool xfb = tes->nir->xfb_info && ctx->streamout.num_targets > 0;
+   bool queries = ctx->nr_prim_queries > 0 && ctx->active_queries;
+   return xfb || queries;
+}
+
+static void
+panfrost_draw_passthrough_gs(struct pipe_context *pipe,
+                             const struct pipe_draw_info *info,
+                             unsigned drawid_offset,
+                             const struct pipe_draw_indirect_info *indirect,
+                             const struct pipe_draw_start_count_bias *draws,
+                             unsigned num_draws)
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+   struct panfrost_uncompiled_shader *tes =
+      ctx->uncompiled[MESA_SHADER_TESS_EVAL];
+   struct panfrost_uncompiled_shader *prev =
+      tes ? tes : ctx->uncompiled[MESA_SHADER_VERTEX];
+   struct panfrost_uncompiled_shader *fs =
+      ctx->uncompiled[MESA_SHADER_FRAGMENT];
+
+   if (!prev || !prev->outputs_nir || !fs) {
+      perf_debug(ctx, "Draw needing a geometry shader stage dropped");
+      return;
+   }
+
+   enum mesa_prim mode = info->mode;
+   if (tes) {
+      mode = panfrost_tess_output_prim(ctx->uncompiled[MESA_SHADER_TESS_CTRL]->tess,
+                                       tes->tess);
+   }
+
+   perf_debug(ctx, "Passthrough geometry shader");
+
+   struct panfrost_uncompiled_shader *gs =
+      panfrost_get_passthrough_gs(ctx, prev, mode);
+
+   /* The fragment shader reads the varyings of the geometry shader's
+    * rasterization program now.
+    */
+   struct pan_varying_layout fs_layout = fs->vs_varying_layout;
+   fs->vs_varying_layout = gs->gs->rast->vs_varying_layout;
+
+   pipe->bind_gs_state(pipe, gs);
+   panfrost_update_shader_variant(ctx, MESA_SHADER_FRAGMENT);
+
+   pipe->draw_vbo(pipe, info, drawid_offset, indirect, draws, num_draws);
+
+   pipe->bind_gs_state(pipe, NULL);
+   fs->vs_varying_layout = fs_layout;
+   panfrost_update_shader_variant(ctx, MESA_SHADER_FRAGMENT);
+}
+#endif
+
 static void
 panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                   unsigned drawid_offset,
@@ -4380,12 +4669,9 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    ctx->draw_calls++;
 
 #if PAN_ARCH >= 6 && PAN_ARCH <= 7
-   /* Adjacency primitives are only drawn through a geometry shader.
-    * TODO: passthrough geometry shader when none is bound.
-    */
-   if (mesa_prim_has_adjacency(info->mode) &&
-       !ctx->uncompiled[MESA_SHADER_GEOMETRY]) {
-      perf_debug(ctx, "Adjacency draw without a geometry shader dropped");
+   if (panfrost_needs_passthrough_gs(ctx, info)) {
+      panfrost_draw_passthrough_gs(pipe, info, drawid_offset, indirect, draws,
+                                   num_draws);
       return;
    }
 

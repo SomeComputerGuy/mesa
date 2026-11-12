@@ -166,6 +166,11 @@ struct panfrost_context {
    bool active_queries;
    uint64_t prims_generated;
    uint64_t tf_prims_generated;
+
+   /* Number of active PRIMITIVES_GENERATED / PRIMITIVES_EMITTED queries:
+    * geometry and tessellation draws count their primitives on the GPU then.
+    */
+   unsigned nr_prim_queries;
    uint64_t draw_calls;
    struct panfrost_query *occlusion_query;
 
@@ -288,6 +293,9 @@ struct panfrost_context {
        */
       uint64_t sink;
 
+      /* Pipeline statistics counters of the programs (not exposed) */
+      uint64_t stat_sink;
+
       uint32_t provoking_last;
    } poly;
 };
@@ -356,6 +364,7 @@ enum {
    PAN_SYSVAL_POLY_TESS_PARAMS = 2,
    PAN_SYSVAL_POLY_SINK = 3,
    PAN_SYSVAL_POLY_PROVOKING_LAST = 4,
+   PAN_SYSVAL_POLY_STAT_SINK = 5,
 };
 
 #define PAN_TXS_SYSVAL_ID(texidx, dim, is_array)                               \
@@ -489,6 +498,12 @@ struct panfrost_gs_progs {
    /* 1x1x1 compute program updating counters (transform feedback/queries) */
    struct panfrost_uncompiled_shader *pre_gs;
 
+   /* Whether the main program writes transform feedback, and the strides of
+    * the buffers in bytes.
+    */
+   bool xfb;
+   uint16_t xfb_stride[POLY_MAX_SO_BUFFERS];
+
    /* Hardware vertex shader of the rasterization draw: re-runs the geometry
     * shader for each output vertex.
     */
@@ -522,6 +537,12 @@ struct panfrost_tess_progs {
     * invocation per domain point.
     */
    struct panfrost_uncompiled_shader *tes;
+
+   /* Evaluation shader feeding a geometry shader: compute program, one
+    * invocation per tessellator index, storing its outputs to memory. Created
+    * on first use.
+    */
+   struct panfrost_uncompiled_shader *tes_cs;
 };
 
 /* Shader CSO */
@@ -560,6 +581,15 @@ struct panfrost_uncompiled_shader {
     * for the memory layout of outputs_to_memory variants.
     */
    uint64_t outputs_written;
+
+   /* Vertex and tessellation evaluation shaders on job manager GPUs: a shader
+    * holding only the output variables and the transform feedback info, to
+    * build passthrough geometry shaders from (adjacency draws without a
+    * geometry shader, transform feedback and queries after tessellation),
+    * and those geometry shaders, by input primitive.
+    */
+   nir_shader *outputs_nir;
+   struct panfrost_uncompiled_shader *passthrough_gs[MESA_PRIM_COUNT];
 
    /* On fragments shaders, bit mask of varyings using noprespective
     * interpolation, starting at VARYING_SLOT_VAR0 */
@@ -708,6 +738,16 @@ void panfrost_nir_lower_gs(const nir_shader *nir, struct poly_gs_info *info,
                            unsigned *wg_size, unsigned *vertex_stride);
 nir_shader *panfrost_nir_lower_tcs(const nir_shader *nir);
 nir_shader *panfrost_nir_lower_tes(const nir_shader *nir);
+nir_shader *panfrost_nir_lower_tes_to_compute(const nir_shader *nir);
+
+/* Geometry and tessellation draws on job manager GPUs (pan_shader.c) */
+struct panfrost_uncompiled_shader *
+panfrost_get_tes_compute(struct panfrost_context *ctx,
+                         struct panfrost_uncompiled_shader *tes);
+struct panfrost_uncompiled_shader *
+panfrost_get_passthrough_gs(struct panfrost_context *ctx,
+                            struct panfrost_uncompiled_shader *prev,
+                            enum mesa_prim mode);
 
 /* Variant of a shader for the current state (pan_shader.c) */
 struct panfrost_compiled_shader *

@@ -771,9 +771,11 @@ panfrost_begin_query(struct pipe_context *pipe, struct pipe_query *q)
 
    case PIPE_QUERY_PRIMITIVES_GENERATED:
       query->start = ctx->prims_generated;
+      ctx->nr_prim_queries++;
       break;
    case PIPE_QUERY_PRIMITIVES_EMITTED:
       query->start = ctx->tf_prims_generated;
+      ctx->nr_prim_queries++;
       break;
 
    case PAN_QUERY_DRAW_CALLS:
@@ -816,9 +818,13 @@ panfrost_end_query(struct pipe_context *pipe, struct pipe_query *q)
    }
    case PIPE_QUERY_PRIMITIVES_GENERATED:
       query->end = ctx->prims_generated;
+      assert(ctx->nr_prim_queries > 0);
+      ctx->nr_prim_queries--;
       break;
    case PIPE_QUERY_PRIMITIVES_EMITTED:
       query->end = ctx->tf_prims_generated;
+      assert(ctx->nr_prim_queries > 0);
+      ctx->nr_prim_queries--;
       break;
    case PAN_QUERY_DRAW_CALLS:
       query->end = ctx->draw_calls;

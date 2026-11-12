@@ -12,6 +12,27 @@
 
 #if (PAN_ARCH >= 6 && PAN_ARCH <= 7)
 #include "poly/cl/tessellator.h"
+#include "poly/geometry.h"
+
+/*
+ * Geometry shaders with transform feedback and unknown output counts: inclusive
+ * prefix sum of each word of the per-primitive counts written by the count
+ * program. Serial: one invocation.
+ */
+KERNEL(1)
+panlib_gs_prefix_sum(global struct poly_geometry_params *p)
+{
+   uint words = p->count_buffer_stride / 4;
+
+   for (uint w = 0; w < words; ++w) {
+      uint sum = 0;
+
+      for (uint i = 0; i < p->input_primitives; ++i) {
+         sum += p->count_buffer[i * words + w];
+         p->count_buffer[i * words + w] = sum;
+      }
+   }
+}
 
 /* One invocation per patch. prim is a enum tess_primitive_mode. */
 KERNEL(64)

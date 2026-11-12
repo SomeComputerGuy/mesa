@@ -149,7 +149,7 @@ panfrost_nir_lower_vs_to_memory(nir_shader *nir)
  * 32-bit word in the geometry parameters.
  */
 static void
-guard_global_id_x(nir_shader *nir, unsigned gp_offset)
+guard_global_id_x(nir_shader *nir, unsigned offset, bool vertex_params)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
 
@@ -157,9 +157,10 @@ guard_global_id_x(nir_shader *nir, unsigned gp_offset)
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
 
    nir_builder b = nir_builder_at(nir_before_impl(impl));
-   nir_def *gp = nir_load_geometry_param_buffer_poly(&b);
+   nir_def *params = vertex_params ? nir_load_vertex_param_buffer_poly(&b)
+                                   : nir_load_geometry_param_buffer_poly(&b);
    nir_def *limit = nir_load_global_constant(
-      &b, 1, 32, nir_iadd_imm(&b, gp, gp_offset), .align_mul = 4);
+      &b, 1, 32, nir_iadd_imm(&b, params, offset), .align_mul = 4);
    nir_def *x = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
 
    nir_push_if(&b, nir_ult(&b, x, limit));
@@ -182,6 +183,7 @@ make_compute(nir_shader *nir, unsigned wg_x)
    nir->info.workgroup_size_variable = false;
    nir->info.outputs_written = 0;
    nir->info.inputs_read = 0;
+   nir->info.has_transform_feedback_varyings = false;
    nir->xfb_info = NULL;
 
    NIR_PASS(_, nir, nir_remove_dead_variables,
@@ -205,10 +207,6 @@ panfrost_nir_lower_gs(const nir_shader *nir, struct poly_gs_info *info,
 {
    nir_shader *gs = nir_shader_clone(NULL, nir);
 
-   /* TODO: transform feedback of geometry shader outputs */
-   gs->xfb_info = NULL;
-   gs->info.has_transform_feedback_varyings = false;
-
    NIR_PASS(_, gs, panfrost_nir_widen_poly_io);
 
    nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
@@ -218,12 +216,13 @@ panfrost_nir_lower_gs(const nir_shader *nir, struct poly_gs_info *info,
    *vertex_stride = util_next_power_of_two(gs->info.gs.vertices_out);
 
    /* Main program: (primitive, instance) -> global invocation (x, y) */
-   guard_global_id_x(gs, offsetof(struct poly_geometry_params, grid[0]));
+   guard_global_id_x(gs, offsetof(struct poly_geometry_params, grid[0]), false);
    make_compute(gs, PAN_GS_WG_SIZE);
    *wg_size = PAN_GS_WG_SIZE;
 
    if (count) {
-      guard_global_id_x(count, offsetof(struct poly_geometry_params, grid[0]));
+      guard_global_id_x(count, offsetof(struct poly_geometry_params, grid[0]),
+                        false);
       make_compute(count, PAN_GS_WG_SIZE);
    }
 
@@ -304,5 +303,31 @@ panfrost_nir_lower_tes(const nir_shader *nir)
    tes->info.patch_inputs_read = 0;
    NIR_PASS(_, tes, nir_recompute_io_bases, nir_var_shader_out);
    nir_shader_gather_info(tes, nir_shader_get_entrypoint(tes));
+   return tes;
+}
+
+/* Width of the workgroups of the evaluation shader compute program */
+#define PAN_TES_CS_WG_SIZE 16
+
+/*
+ * Lower a tessellation evaluation shader (I/O already lowered) feeding a
+ * geometry shader to a compute program: one invocation per index of the
+ * tessellator's index buffer, storing its outputs to the poly vertex output
+ * buffer in draw order, so the geometry shader sees a non-indexed draw. The
+ * number of invocations is grid[0] of the vertex parameters.
+ */
+nir_shader *
+panfrost_nir_lower_tes_to_compute(const nir_shader *nir)
+{
+   nir_shader *tes = nir_shader_clone(NULL, nir);
+   uint64_t outputs = tes->info.outputs_written;
+
+   NIR_PASS(_, tes, panfrost_nir_widen_poly_io);
+   NIR_PASS(_, tes, poly_nir_lower_tes, false);
+   NIR_PASS(_, tes, poly_nir_lower_vs_before_gs);
+   tes->info.outputs_written = outputs;
+
+   guard_global_id_x(tes, offsetof(struct poly_vertex_params, grid[0]), true);
+   make_compute(tes, PAN_TES_CS_WG_SIZE);
    return tes;
 }

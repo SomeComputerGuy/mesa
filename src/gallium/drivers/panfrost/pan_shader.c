@@ -13,6 +13,7 @@
 #include "util/u_prim.h"
 #include "nir_builder.h"
 #include "nir_serialize.h"
+#include "nir_xfb_info.h"
 #include "pan_bo.h"
 #include "pan_context.h"
 #include "pan_compiler.h"
@@ -623,11 +624,13 @@ panfrost_create_gs_progs(struct panfrost_context *ctx,
                          &gs->vertex_stride);
 
    gs->main = panfrost_create_internal_shader(ctx, main_nir);
+   gs->pre_gs = panfrost_create_internal_shader(ctx, pre_gs_nir);
+   gs->xfb = gs->info.xfb;
 
-   /* The pre-GS program only updates transform feedback and query counters,
-    * not supported with geometry shaders yet.
-    */
-   ralloc_free(pre_gs_nir);
+   if (so->nir->xfb_info) {
+      for (unsigned i = 0; i < POLY_MAX_SO_BUFFERS; ++i)
+         gs->xfb_stride[i] = so->nir->xfb_info->buffers[i].stride;
+   }
 
    gs->rast = panfrost_create_internal_shader(ctx, rast_nir);
    if (count_nir)
@@ -661,6 +664,72 @@ panfrost_create_tess_progs(struct panfrost_context *ctx,
    so->tess = t;
 }
 
+/* Keep the output variables and the transform feedback info of a vertex or
+ * tessellation evaluation shader, to build passthrough geometry shaders.
+ */
+static nir_shader *
+panfrost_keep_outputs_nir(void *mem_ctx, const nir_shader *nir)
+{
+   nir_shader *shell =
+      nir_shader_create(mem_ctx, nir->info.stage, nir->options);
+
+   shell->info = nir->info;
+   shell->info.name = NULL;
+   shell->info.label = NULL;
+
+   nir_foreach_shader_out_variable(var, nir)
+      nir_shader_add_variable(shell, nir_variable_clone(var, shell));
+
+   if (nir->xfb_info) {
+      size_t size = nir_xfb_info_size(nir->xfb_info->output_count);
+      shell->xfb_info = ralloc_memdup(shell, nir->xfb_info, size);
+   }
+
+   return shell;
+}
+
+static void *
+panfrost_create_shader_state(struct pipe_context *pctx,
+                             const struct pipe_shader_state *cso);
+
+struct panfrost_uncompiled_shader *
+panfrost_get_tes_compute(struct panfrost_context *ctx,
+                         struct panfrost_uncompiled_shader *tes)
+{
+   struct panfrost_tess_progs *t = tes->tess;
+
+   if (!t->tes_cs) {
+      t->tes_cs = panfrost_create_internal_shader(
+         ctx, panfrost_nir_lower_tes_to_compute(tes->nir));
+   }
+
+   return t->tes_cs;
+}
+
+struct panfrost_uncompiled_shader *
+panfrost_get_passthrough_gs(struct panfrost_context *ctx,
+                            struct panfrost_uncompiled_shader *prev,
+                            enum mesa_prim mode)
+{
+   assert(mode < MESA_PRIM_COUNT && prev->outputs_nir);
+
+   if (!prev->passthrough_gs[mode]) {
+      nir_shader *gs = nir_create_passthrough_gs(
+         ctx->base.screen->nir_options[MESA_SHADER_GEOMETRY],
+         prev->outputs_nir, mode, mode, false, false, false);
+
+      struct pipe_shader_state state = {
+         .type = PIPE_SHADER_IR_NIR,
+         .ir.nir = gs,
+      };
+
+      prev->passthrough_gs[mode] =
+         panfrost_create_shader_state(&ctx->base, &state);
+   }
+
+   return prev->passthrough_gs[mode];
+}
+
 static void *
 panfrost_create_shader_state(struct pipe_context *pctx,
                              const struct pipe_shader_state *cso)
@@ -680,6 +749,12 @@ panfrost_create_shader_state(struct pipe_context *pctx,
 
    so->stream_output = cso->stream_output;
    so->nir = nir;
+
+   if ((nir->info.stage == MESA_SHADER_VERTEX ||
+        nir->info.stage == MESA_SHADER_TESS_EVAL) &&
+       pan_device(pctx->screen)->arch >= 6 &&
+       pan_device(pctx->screen)->arch <= 7)
+      so->outputs_nir = panfrost_keep_outputs_nir(so, nir);
 
    /* PLS lowering is not taken care of by glsl_to_nir(), so do it here. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
@@ -844,6 +919,12 @@ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
       panfrost_delete_shader_state(pctx, cso->gs->rast);
       if (cso->gs->count)
          panfrost_delete_shader_state(pctx, cso->gs->count);
+      panfrost_delete_shader_state(pctx, cso->gs->pre_gs);
+   }
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cso->passthrough_gs); ++i) {
+      if (cso->passthrough_gs[i])
+         panfrost_delete_shader_state(pctx, cso->passthrough_gs[i]);
    }
 
    if (cso->tess) {
@@ -851,6 +932,8 @@ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
          panfrost_delete_shader_state(pctx, cso->tess->tcs);
       if (cso->tess->tes)
          panfrost_delete_shader_state(pctx, cso->tess->tes);
+      if (cso->tess->tes_cs)
+         panfrost_delete_shader_state(pctx, cso->tess->tes_cs);
    }
 
    simple_mtx_destroy(&cso->lock);
