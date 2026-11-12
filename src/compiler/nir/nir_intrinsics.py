@@ -1935,6 +1935,10 @@ system_value("multisampled_pan", 1, bit_sizes=[32])
 # noperspective, this is 32 bits and starts from VARYING_SLOT_VAR0.
 system_value("noperspective_varyings_pan", 1, bit_sizes=[32])
 
+# Framebuffer layer drawn by a layered draw repeated per layer on job manager
+# Mali GPUs, ~0 when the framebuffer is not layered.
+system_value("draw_layer_pan", 1, bit_sizes=[32])
+
 # Render area of the framebuffer.  Used by framebuffer load shaders.
 # The returned vector is (min_x, min_y, max_x, max_y)
 system_value("fb_render_area_pan", 4, bit_sizes=[16])
