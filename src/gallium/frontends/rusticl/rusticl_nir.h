@@ -31,5 +31,19 @@ bool rusticl_lower_global_to_shared_scratch(nir_shader *nir);
 bool rusticl_lower_wg_collectives(nir_shader *nir, unsigned max_invocations);
 bool rusticl_lower_non_uniform_ids(nir_shader *nir);
 bool rusticl_gather_global_initializers(nir_shader *nir, void *dst);
+
+/* An address in the initial values of the program-scope variables: the
+ * size-byte slot at offset holds a byte offset into the variable at
+ * driver_location target, to which the address of the buffer plus target is
+ * added once the buffer exists.
+ */
+struct rusticl_global_reloc {
+    uint32_t offset;
+    uint32_t target;
+    uint32_t size;
+};
+
+unsigned rusticl_gather_global_relocs(nir_shader *nir, struct rusticl_global_reloc *relocs,
+                                      unsigned max);
 bool rusticl_has_global_pointer_initializers(nir_shader *nir);
 bool rusticl_lower_pipes(nir_shader *nir);

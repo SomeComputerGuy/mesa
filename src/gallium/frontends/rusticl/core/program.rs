@@ -96,8 +96,9 @@ pub struct Program {
     pub devs: Vec<&'static Device>,
     pub src: ProgramSourceType,
     build: Mutex<ProgramBuild>,
-    /// The buffers of the program-scope global variables, one per device
-    globals: Mutex<HashMap<&'static Device, Arc<PipeResourceOwned>>>,
+    /// per device: the buffer of the program-scope variables, and whether the addresses in it are
+    /// filled in
+    globals: Mutex<HashMap<&'static Device, (Arc<PipeResourceOwned>, bool)>>,
 }
 
 impl_cl_type_trait!(cl_program, Program, CL_INVALID_PROGRAM);
@@ -681,15 +682,16 @@ impl Program {
     }
 
     /// The buffer of the program-scope global variables on dev, created with their initial values
-    /// at the first launch of a kernel of the program.
+    /// at the first launch of a kernel of the program. Addresses of variables in the initial
+    /// values are filled in by relocate_globals() once the launch knows the buffer's address.
     pub fn globals_buffer(
         &self,
         dev: &'static Device,
-        init: &[u8],
+        init: &ProgramGlobalsInit,
     ) -> CLResult<Arc<PipeResourceOwned>> {
         let mut globals = self.globals.lock().unwrap();
-        if let Some(res) = globals.get(dev) {
-            if res.width() as usize == init.len() {
+        if let Some((res, _)) = globals.get(dev) {
+            if res.width() as usize == init.data.len() {
                 return Ok(Arc::clone(res));
             }
         }
@@ -697,18 +699,49 @@ impl Program {
         let res = dev
             .screen()
             .resource_create_buffer(
-                init.len() as u32,
+                init.data.len() as u32,
                 ResourceType::Normal,
                 PIPE_BIND_GLOBAL,
                 0,
             )
             .ok_or(CL_OUT_OF_RESOURCES)?;
         dev.helper_ctx()
-            .exec(|ctx| ctx.buffer_subdata(&res, 0, init.as_ptr().cast(), init.len() as u32))
+            .exec(|ctx| {
+                ctx.buffer_subdata(&res, 0, init.data.as_ptr().cast(), init.data.len() as u32)
+            })
             .wait();
         let res = Arc::new(res);
-        globals.insert(dev, Arc::clone(&res));
+        globals.insert(dev, (Arc::clone(&res), init.relocs.is_empty()));
         Ok(res)
+    }
+
+    /// Fills in the addresses of variables in the initial values of the program-scope variables
+    /// (once per device), base being the address of the buffer from globals_buffer() as kernels
+    /// see it. Called before the kernel is launched.
+    pub fn relocate_globals(&self, dev: &'static Device, init: &ProgramGlobalsInit, base: u64) {
+        let mut globals = self.globals.lock().unwrap();
+        let Some((res, relocated)) = globals.get_mut(dev) else {
+            return;
+        };
+        if *relocated {
+            return;
+        }
+
+        let mut data = init.data.clone();
+        for r in &init.relocs {
+            let size = r.size as usize;
+            let at = r.offset as usize..r.offset as usize + size;
+            let mut val = [0u8; 8];
+            val[..size].copy_from_slice(&data[at.clone()]);
+            let addr = u64::from_le_bytes(val)
+                .wrapping_add(base)
+                .wrapping_add(r.target.into());
+            data[at].copy_from_slice(&addr.to_le_bytes()[..size]);
+        }
+        dev.helper_ctx()
+            .exec(|ctx| ctx.buffer_subdata(res, 0, data.as_ptr().cast(), data.len() as u32))
+            .wait();
+        *relocated = true;
     }
 
     pub fn build_info(&self) -> MutexGuard<'_, ProgramBuild> {

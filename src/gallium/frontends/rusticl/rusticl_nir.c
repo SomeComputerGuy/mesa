@@ -755,8 +755,10 @@ rusticl_lower_non_uniform_ids(nir_shader *nir)
 /* Program-scope global variables, laid out by nir_lower_vars_to_explicit_types
  * (driver_location, global_mem_size, the same layout in every kernel of a
  * program): writes their initial values to dst (global_mem_size bytes),
- * zero for variables without an initializer. Pointer initializers (addresses
- * of other variables) are not supported: returns false then.
+ * zero for variables without an initializer. Addresses of variables in the
+ * initializers (nir_constant::pointer_target) are written as the byte offset
+ * into their target, rusticl_gather_global_relocs lists them. Returns false
+ * for nir_variable::pointer_initializer, which OpenCL does not use.
  */
 bool
 rusticl_gather_global_initializers(nir_shader *nir, void *dst)
@@ -773,6 +775,66 @@ rusticl_gather_global_initializers(nir_shader *nir, void *dst)
    memset(dst, 0, nir->global_mem_size);
    nir_gather_explicit_io_initializers(nir, dst, nir->global_mem_size, nir_var_mem_global);
    return true;
+}
+
+struct gather_relocs_state {
+   struct rusticl_global_reloc *relocs;
+   unsigned max;
+   unsigned count;
+};
+
+static void
+gather_relocs(struct gather_relocs_state *state, const nir_constant *c,
+              const struct glsl_type *type, uint32_t offset)
+{
+   if (glsl_type_is_vector_or_scalar(type)) {
+      if (!c->pointer_target)
+         return;
+      assert(glsl_type_is_scalar(type));
+      /* Only the program-scope variables have their addresses here. */
+      assert(c->pointer_target->data.mode == nir_var_mem_global);
+      if (state->count < state->max) {
+         state->relocs[state->count] = (struct rusticl_global_reloc) {
+            .offset = offset,
+            .target = c->pointer_target->data.driver_location,
+            .size = glsl_get_bit_size(type) / 8,
+         };
+      }
+      state->count++;
+   } else if (glsl_type_is_array_or_matrix(type)) {
+      const unsigned stride = glsl_get_explicit_stride(type);
+      const struct glsl_type *elem_type = glsl_get_array_element(type);
+      for (unsigned i = 0; i < c->num_elements; i++)
+         gather_relocs(state, c->elements[i], elem_type, offset + i * stride);
+   } else {
+      assert(glsl_type_is_struct_or_ifc(type));
+      for (unsigned i = 0; i < c->num_elements; i++) {
+         gather_relocs(state, c->elements[i], glsl_get_struct_field(type, i),
+                       offset + glsl_get_struct_field_offset(type, i));
+      }
+   }
+}
+
+/* The addresses in the initial values written by
+ * rusticl_gather_global_initializers: fills in up to max relocations and
+ * returns how many there are.
+ */
+unsigned
+rusticl_gather_global_relocs(nir_shader *nir, struct rusticl_global_reloc *relocs,
+                             unsigned max)
+{
+   struct gather_relocs_state state = {
+      .relocs = relocs,
+      .max = max,
+   };
+
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_global) {
+      if (var->constant_initializer) {
+         gather_relocs(&state, var->constant_initializer, var->type,
+                       var->data.driver_location);
+      }
+   }
+   return state.count;
 }
 
 bool

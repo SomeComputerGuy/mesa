@@ -502,6 +502,16 @@ impl NirShader {
             .then_some(buf)
     }
 
+    /// The addresses in the initial values of global_initializers()
+    pub fn global_relocs(&mut self) -> Vec<rusticl_global_reloc> {
+        let nir = self.nir.as_ptr();
+        let count = unsafe { rusticl_gather_global_relocs(nir, ptr::null_mut(), 0) };
+        let mut relocs = vec![rusticl_global_reloc::default(); count as usize];
+        let filled = unsafe { rusticl_gather_global_relocs(nir, relocs.as_mut_ptr(), count) };
+        assert_eq!(filled, count);
+        relocs
+    }
+
     pub fn get_constant_buffer(&self) -> &[u8] {
         unsafe {
             let nir = self.nir.as_ref();

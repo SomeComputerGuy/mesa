@@ -147,7 +147,24 @@ enum CompiledKernelArgType {
     SharedSize,
     EnqueuedLocalSize,
     /// The buffer of the program-scope global variables, with their initial values
-    ProgramGlobals(Arc<Vec<u8>>),
+    ProgramGlobals(Arc<ProgramGlobalsInit>),
+}
+
+/// An address in the initial values of the program-scope variables: the size-byte slot at offset
+/// holds a byte offset into the variable at target (an offset into the same buffer)
+#[derive(Hash, PartialEq, Eq, Clone, Default)]
+pub struct GlobalReloc {
+    pub offset: u32,
+    pub target: u32,
+    pub size: u8,
+}
+
+/// Initial contents of the buffer of the program-scope global variables
+#[derive(Hash, PartialEq, Eq, Clone, Default)]
+pub struct ProgramGlobalsInit {
+    pub data: Vec<u8>,
+    /// filled in with the address of the buffer once it exists
+    pub relocs: Vec<GlobalReloc>,
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -306,8 +323,15 @@ impl CompiledKernelArg {
                     CompiledKernelArgType::EnqueuedLocalSize => blob_write_uint8(blob, 12),
                     CompiledKernelArgType::ProgramGlobals(init) => {
                         blob_write_uint8(blob, 13);
-                        blob_write_uint32(blob, init.len() as u32);
-                        blob_write_bytes(blob, init.as_ptr().cast(), init.len())
+                        blob_write_uint32(blob, init.data.len() as u32);
+                        blob_write_bytes(blob, init.data.as_ptr().cast(), init.data.len());
+                        blob_write_uint32(blob, init.relocs.len() as u32);
+                        for r in &init.relocs {
+                            blob_write_uint32(blob, r.offset);
+                            blob_write_uint32(blob, r.target);
+                            blob_write_uint8(blob, r.size);
+                        }
+                        true
                     }
                     &CompiledKernelArgType::APIArg(idx) => {
                         blob_write_uint8(blob, 10);
@@ -351,9 +375,23 @@ impl CompiledKernelArg {
                         if ptr.is_null() {
                             return None;
                         }
-                        CompiledKernelArgType::ProgramGlobals(Arc::new(
-                            slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec(),
-                        ))
+                        let data = slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec();
+                        let num_relocs = blob_read_uint32(blob) as usize;
+                        let mut relocs = Vec::with_capacity(num_relocs);
+                        for _ in 0..num_relocs {
+                            relocs.push(GlobalReloc {
+                                offset: blob_read_uint32(blob),
+                                target: blob_read_uint32(blob),
+                                size: blob_read_uint8(blob),
+                            });
+                        }
+                        if blob.overrun {
+                            return None;
+                        }
+                        CompiledKernelArgType::ProgramGlobals(Arc::new(ProgramGlobalsInit {
+                            data,
+                            relocs,
+                        }))
                     }
                     10 => {
                         let idx = blob_read_uint32(blob) as usize;
@@ -494,7 +532,7 @@ impl NirKernelBuilds {
             .compiled_args
             .iter()
             .find_map(|a| match &a.kind {
-                CompiledKernelArgType::ProgramGlobals(init) => Some(init.len()),
+                CompiledKernelArgType::ProgramGlobals(init) => Some(init.data.len()),
                 _ => None,
             })
             .unwrap_or(0)
@@ -1114,11 +1152,20 @@ fn compile_nir_variant(
     // every kernel of a program has all its program-scope variables (none was removed so far), in
     // the same order: one layout for the whole program
     if has_globals {
-        let init = nir
+        let data = nir
             .global_initializers()
             .expect("pointer initializers are refused in compile_nir_to_args");
+        let relocs = nir
+            .global_relocs()
+            .iter()
+            .map(|r| GlobalReloc {
+                offset: r.offset,
+                target: r.target,
+                size: r.size as u8,
+            })
+            .collect();
         compiled_args[lower_state.program_globals_loc].kind =
-            CompiledKernelArgType::ProgramGlobals(Arc::new(init));
+            CompiledKernelArgType::ProgramGlobals(Arc::new(ProgramGlobalsInit { data, relocs }));
     }
 
     opt_nir(nir, dev, true);
@@ -1918,8 +1965,10 @@ impl Kernel {
                     CompiledKernelArgType::ProgramGlobals(init) => Some(init),
                     _ => None,
                 })
-                .map(|init| prog.globals_buffer(ctx.dev, init))
+                .map(|init| prog.globals_buffer(ctx.dev, init).map(|res| (res, init)))
                 .transpose()?;
+            // index of the buffer of the program-scope variables in the global bindings
+            let mut program_globals_binding = None;
             let mut exec_builder =
                 KernelExecBuilder::new(ctx.dev, nir_kernel_build.input_size, buffer_arcs.len() + 2);
             // Set it once so we get the alignment padding right
@@ -2079,7 +2128,8 @@ impl Kernel {
                         }
                     }
                     CompiledKernelArgType::ProgramGlobals(_) => {
-                        exec_builder.add_global(program_globals.as_ref().unwrap(), 0);
+                        program_globals_binding = Some(exec_builder.resources.len());
+                        exec_builder.add_global(&program_globals.as_ref().unwrap().0, 0);
                     }
                     CompiledKernelArgType::ConstantBuffer => {
                         assert!(nir_kernel_build.constant_buffer.is_some());
@@ -2182,6 +2232,19 @@ impl Kernel {
             ctx.bind_sampler_views(sviews);
             ctx.bind_shader_images(iviews);
             ctx.set_global_binding(resources, &mut globals);
+
+            // The binding gave the address of the buffer of the program-scope variables: fill in
+            // the addresses in their initial values before the first kernel runs.
+            if let (Some((_, init)), Some(idx)) = (&program_globals, program_globals_binding) {
+                if !init.relocs.is_empty() {
+                    let base = if ctx.dev.address_bits() == 64 {
+                        unsafe { globals[idx].cast::<u64>().read_unaligned() }
+                    } else {
+                        unsafe { globals[idx].read_unaligned() }.into()
+                    };
+                    prog.relocate_globals(ctx.dev, init, base);
+                }
+            }
 
             ctx.memory_barrier(read_barriers);
 
