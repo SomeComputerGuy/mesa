@@ -706,6 +706,11 @@ impl DeviceBase {
             add_feat(1, 0, 0, "__opencl_c_pipes");
         }
 
+        if self.device_enqueue_supported() {
+            add_cap(SpvCapability::SpvCapabilityDeviceEnqueue);
+            add_feat(1, 0, 0, "__opencl_c_device_enqueue");
+        }
+
         if self.wg_collectives_supported() {
             add_cap(SpvCapability::SpvCapabilityGroups);
             add_feat(1, 0, 0, "__opencl_c_work_group_collective_functions");
@@ -916,6 +921,30 @@ impl DeviceBase {
     /// __opencl_c_pipes together with __opencl_c_generic_address_space.
     pub fn pipes_supported(&self) -> bool {
         self.generic_address_space_supported()
+    }
+
+    /// OpenCL 2.0 device-side enqueue: kernels append records to the buffer of an on-device queue
+    /// (vtn_handle_device_enqueue), the host launches them after the kernel (as the Arm blob does).
+    /// clang only accepts __opencl_c_device_enqueue with the generic address space.
+    pub fn device_enqueue_supported(&self) -> bool {
+        self.generic_address_space_supported()
+    }
+
+    /// as the Arm blob: 2 MiB by default, up to 16 MiB
+    pub fn queue_on_device_preferred_size(&self) -> u32 {
+        if self.device_enqueue_supported() {
+            2 << 20
+        } else {
+            0
+        }
+    }
+
+    pub fn queue_on_device_max_size(&self) -> u32 {
+        if self.device_enqueue_supported() {
+            16 << 20
+        } else {
+            0
+        }
     }
 
     pub fn wg_collectives_supported(&self) -> bool {
@@ -1439,6 +1468,7 @@ impl DeviceBase {
             extended_bit_ops: true,
             program_scope_global_variables: true,
             pipes: self.pipes_supported(),
+            device_enqueue: self.device_enqueue_supported(),
             fp16: self.fp16_supported(),
             fp64: self.fp64_supported(),
             generic_address_space: self.generic_address_space_supported(),
@@ -1753,3 +1783,4 @@ pub fn get_dev_for_uuid(uuid: [c_char; UUID_SIZE]) -> Option<&'static Device> {
         uuid == d.screen().device_uuid().unwrap()
     })
 }
+

@@ -4,7 +4,9 @@
 use crate::api::icd::*;
 use crate::api::types::IdpAccelProps;
 use crate::api::util::*;
+use crate::core::context::*;
 use crate::core::device::*;
+use crate::core::queue::*;
 use crate::core::platform::*;
 use crate::core::version::*;
 
@@ -18,6 +20,7 @@ use std::cmp::min;
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::ptr;
+use std::sync::Arc;
 
 const SPIRV_SUPPORT_STRING: &CStr =
     c"SPIR-V_1.0 SPIR-V_1.1 SPIR-V_1.2 SPIR-V_1.3 SPIR-V_1.4 SPIR-V_1.5 SPIR-V_1.6";
@@ -72,7 +75,13 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
                 v.write::<cl_device_device_enqueue_capabilities>(0)
             }
             CL_DEVICE_DEVICE_ENQUEUE_CAPABILITIES => {
-                v.write::<cl_device_device_enqueue_capabilities>(0)
+                v.write::<cl_device_device_enqueue_capabilities>(
+                    if dev.device_enqueue_supported() {
+                        (CL_DEVICE_QUEUE_SUPPORTED | CL_DEVICE_QUEUE_REPLACEABLE_DEFAULT).into()
+                    } else {
+                        0
+                    },
+                )
             }
             CL_DEVICE_DEVICE_MEM_CAPABILITIES_INTEL => {
                 v.write::<cl_device_unified_shared_memory_capabilities_intel>(0)
@@ -208,8 +217,12 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             } else {
                 0
             }),
-            CL_DEVICE_MAX_ON_DEVICE_EVENTS => v.write::<cl_uint>(0),
-            CL_DEVICE_MAX_ON_DEVICE_QUEUES => v.write::<cl_uint>(0),
+            CL_DEVICE_MAX_ON_DEVICE_EVENTS => {
+                v.write::<cl_uint>(if dev.device_enqueue_supported() { 1024 } else { 0 })
+            }
+            CL_DEVICE_MAX_ON_DEVICE_QUEUES => {
+                v.write::<cl_uint>(dev.device_enqueue_supported().into())
+            }
             CL_DEVICE_MAX_PARAMETER_SIZE => v.write::<usize>(dev.param_max_size()),
             CL_DEVICE_MAX_PIPE_ARGS => v.write::<cl_uint>(if dev.pipes_supported() { 16 } else { 0 }),
             CL_DEVICE_MAX_READ_IMAGE_ARGS => v.write::<cl_uint>(dev.caps.max_read_images),
@@ -298,9 +311,17 @@ unsafe impl CLInfo<cl_device_info> for cl_device_id {
             CL_DEVICE_PROFILING_TIMER_RESOLUTION => {
                 v.write::<usize>(dev.caps.timer_resolution as usize)
             }
-            CL_DEVICE_QUEUE_ON_DEVICE_MAX_SIZE => v.write::<cl_uint>(0),
-            CL_DEVICE_QUEUE_ON_DEVICE_PREFERRED_SIZE => v.write::<cl_uint>(0),
-            CL_DEVICE_QUEUE_ON_DEVICE_PROPERTIES => v.write::<cl_command_queue_properties>(0),
+            CL_DEVICE_QUEUE_ON_DEVICE_MAX_SIZE => v.write::<cl_uint>(dev.queue_on_device_max_size()),
+            CL_DEVICE_QUEUE_ON_DEVICE_PREFERRED_SIZE => {
+                v.write::<cl_uint>(dev.queue_on_device_preferred_size())
+            }
+            CL_DEVICE_QUEUE_ON_DEVICE_PROPERTIES => {
+                v.write::<cl_command_queue_properties>(if dev.device_enqueue_supported() {
+                    (CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_PROFILING_ENABLE).into()
+                } else {
+                    0
+                })
+            }
             CL_DEVICE_QUEUE_ON_HOST_PROPERTIES => v.write::<cl_command_queue_properties>(
                 (CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE).into(),
             ),
@@ -536,9 +557,28 @@ fn get_host_timer(device_id: cl_device_id, host_timestamp: *mut cl_ulong) -> CLR
 
 #[cl_entrypoint(clSetDefaultDeviceCommandQueue)]
 fn set_default_device_command_queue(
-    _context: cl_context,
-    _device: cl_device_id,
-    _command_queue: cl_command_queue,
+    context: cl_context,
+    device: cl_device_id,
+    command_queue: cl_command_queue,
 ) -> CLResult<()> {
-    Err(CL_INVALID_OPERATION)
+    let c = Context::ref_from_raw(context)?;
+    let d = Device::ref_from_raw(device)?
+        .to_static()
+        .ok_or(CL_INVALID_DEVICE)?;
+    let q = Queue::arc_from_raw(command_queue)?;
+
+    // CL_INVALID_OPERATION if device does not support a replaceable default on-device queue.
+    if !d.device_enqueue_supported() {
+        return Err(CL_INVALID_OPERATION);
+    }
+    // CL_INVALID_DEVICE if device is not a valid device or is not associated with context.
+    if !c.devs.contains(&d) {
+        return Err(CL_INVALID_DEVICE);
+    }
+    // CL_INVALID_COMMAND_QUEUE if command_queue is not a valid command-queue for device.
+    if q.device != d || q.dev_queue.is_none() || !ptr::eq(Arc::as_ptr(&q.context), c) {
+        return Err(CL_INVALID_COMMAND_QUEUE);
+    }
+    c.set_default_device_queue(d, &q);
+    Ok(())
 }

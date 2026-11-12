@@ -79,6 +79,26 @@ impl PipeContext {
         PipeScreen::from_raw(&unsafe { self.pipe().as_ref() }.screen)
     }
 
+    /// buffer_subdata on a borrowed resource
+    pub fn buffer_subdata_ref(
+        &self,
+        res: &PipeResource,
+        offset: c_uint,
+        data: *const c_void,
+        size: c_uint,
+    ) {
+        unsafe {
+            self.pipe.as_ref().buffer_subdata.unwrap()(
+                self.pipe.as_ptr(),
+                res.as_mut_ptr(),
+                pipe_map_flags::PIPE_MAP_WRITE.0,
+                offset,
+                size,
+                data,
+            )
+        }
+    }
+
     pub fn buffer_subdata(
         &self,
         res: &PipeResourceOwned,

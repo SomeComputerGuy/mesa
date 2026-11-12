@@ -117,6 +117,9 @@ pub struct Context {
     >,
     svm: Mutex<SVMContext>,
     pub gl_ctx_manager: Option<GLCtxManager>,
+    /// per device: the default on-device queue, and the stand-in buffer kernels get without one
+    default_dev_queues: Mutex<HashMap<&'static Device, Weak<Queue>>>,
+    null_dev_queues: Mutex<HashMap<&'static Device, Arc<PipeResourceOwned>>>,
 }
 
 impl_cl_type_trait!(cl_context, Context, CL_INVALID_CONTEXT);
@@ -137,7 +140,41 @@ impl Context {
                 svm_ptrs: TrackedPointers::new(),
             }),
             gl_ctx_manager: gl_ctx_manager,
+            default_dev_queues: Mutex::new(HashMap::new()),
+            null_dev_queues: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn default_device_queue(&self, dev: &'static Device) -> Option<Arc<Queue>> {
+        self.default_dev_queues.lock().unwrap().get(dev)?.upgrade()
+    }
+
+    pub fn set_default_device_queue(&self, dev: &'static Device, q: &Arc<Queue>) {
+        self.default_dev_queues
+            .lock()
+            .unwrap()
+            .insert(dev, Arc::downgrade(q));
+    }
+
+    /// The buffer kernels get as their default on-device queue: the default queue's, or an
+    /// invalid stand-in (no records fit, get_default_queue() returns CLK_NULL_QUEUE). Returns the
+    /// buffer and its record capacity, 0 for the stand-in.
+    pub fn device_queue_buffer(
+        &self,
+        dev: &'static Device,
+    ) -> CLResult<(Arc<PipeResourceOwned>, u32)> {
+        if let Some(q) = self.default_device_queue(dev) {
+            if let Some(dq) = &q.dev_queue {
+                return Ok((Arc::clone(&dq.res), dq.size));
+            }
+        }
+        let mut nulls = self.null_dev_queues.lock().unwrap();
+        if let Some(res) = nulls.get(dev) {
+            return Ok((Arc::clone(res), 0));
+        }
+        let res = Arc::new(DeviceQueue::create_buffer(dev, 0)?);
+        nulls.insert(dev, Arc::clone(&res));
+        Ok((res, 0))
     }
 
     pub fn create_buffer(

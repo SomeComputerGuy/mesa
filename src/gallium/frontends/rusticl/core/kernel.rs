@@ -6,7 +6,9 @@ use crate::core::device::*;
 use crate::core::event::*;
 use crate::core::memory::*;
 use crate::core::platform::*;
+use crate::core::context::Context;
 use crate::core::program::*;
+use crate::core::queue::*;
 use crate::impl_cl_type_trait;
 
 use mesa_rust::compiler::clc::*;
@@ -23,6 +25,7 @@ use rusticl_opencl_gen::*;
 use spirv::SpirvKernelInfo;
 
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::cmp;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -65,6 +68,8 @@ pub enum KernelArgValue {
     Image(Weak<Image>),
     LocalMem(usize),
     Sampler(Arc<Sampler>),
+    /// a queue_t argument: the buffer of an on-device queue and its record capacity
+    DevQueue(Arc<PipeResourceOwned>, u32),
 }
 
 #[repr(u8)]
@@ -148,6 +153,8 @@ enum CompiledKernelArgType {
     EnqueuedLocalSize,
     /// The buffer of the program-scope global variables, with their initial values
     ProgramGlobals(Arc<ProgramGlobalsInit>),
+    /// The buffer of the default on-device queue (device-side enqueue)
+    DefaultQueue,
 }
 
 /// An address in the initial values of the program-scope variables: the size-byte slot at offset
@@ -175,6 +182,11 @@ pub struct KernelArg {
 }
 
 impl KernelArg {
+    /// queue_t arguments take an on-device queue (device-side enqueue)
+    pub fn is_queue(&self) -> bool {
+        self.spirv.type_name.as_bytes() == b"queue_t"
+    }
+
     fn from_spirv_nir(spirv: &[spirv::SPIRVKernelArg], nir: &mut NirShader) -> Vec<Self> {
         let nir_arg_map: HashMap<_, _> = nir
             .variables_with_mode(
@@ -321,6 +333,7 @@ impl CompiledKernelArg {
                     CompiledKernelArgType::GlobalWorkSize => blob_write_uint8(blob, 9),
                     CompiledKernelArgType::SharedSize => blob_write_uint8(blob, 11),
                     CompiledKernelArgType::EnqueuedLocalSize => blob_write_uint8(blob, 12),
+                    CompiledKernelArgType::DefaultQueue => blob_write_uint8(blob, 14),
                     CompiledKernelArgType::ProgramGlobals(init) => {
                         blob_write_uint8(blob, 13);
                         blob_write_uint32(blob, init.data.len() as u32);
@@ -369,6 +382,7 @@ impl CompiledKernelArg {
                     9 => CompiledKernelArgType::GlobalWorkSize,
                     11 => CompiledKernelArgType::SharedSize,
                     12 => CompiledKernelArgType::EnqueuedLocalSize,
+                    14 => CompiledKernelArgType::DefaultQueue,
                     13 => {
                         let len = blob_read_uint32(blob) as usize;
                         let ptr = blob_read_bytes(blob, len);
@@ -1082,6 +1096,16 @@ fn compile_nir_variant(
             CompiledKernelArgType::ProgramGlobals(Arc::default()),
             address_bits_ptr_type,
             c"program_globals_addr",
+        );
+    }
+    // device-side enqueue: the buffer of the default on-device queue
+    if unsafe { rusticl_uses_default_queue(nir.get_nir()) } {
+        add_var(
+            nir,
+            &mut lower_state.default_queue_loc,
+            CompiledKernelArgType::DefaultQueue,
+            address_bits_ptr_type,
+            c"default_queue_addr",
         );
     }
     if nir.has_printf() {
@@ -1969,6 +1993,18 @@ impl Kernel {
                 .transpose()?;
             // index of the buffer of the program-scope variables in the global bindings
             let mut program_globals_binding = None;
+            // device-side enqueue: the on-device queues the kernel can enqueue to, with their
+            // record capacity and index in the global bindings
+            let default_queue = if nir_kernel_build
+                .compiled_args
+                .iter()
+                .any(|a| a.kind == CompiledKernelArgType::DefaultQueue)
+            {
+                Some(cl_ctx.device_queue_buffer(ctx.dev)?)
+            } else {
+                None
+            };
+            let mut dev_queues: Vec<(&PipeResourceOwned, u32, usize)> = Vec::new();
             let mut exec_builder =
                 KernelExecBuilder::new(ctx.dev, nir_kernel_build.input_size, buffer_arcs.len() + 2);
             // Set it once so we get the alignment padding right
@@ -2115,6 +2151,10 @@ impl Kernel {
                             KernelArgValue::Sampler(sampler) => {
                                 samplers.push(sampler.pipe());
                             }
+                            KernelArgValue::DevQueue(res, size) => {
+                                dev_queues.push((res, *size, exec_builder.resources.len()));
+                                exec_builder.add_global(res, 0);
+                            }
                             KernelArgValue::None => {
                                 if !arg.dead
                                     && matches!(
@@ -2126,6 +2166,11 @@ impl Kernel {
                                 }
                             }
                         }
+                    }
+                    CompiledKernelArgType::DefaultQueue => {
+                        let (res, size) = default_queue.as_ref().unwrap();
+                        dev_queues.push((res, *size, exec_builder.resources.len()));
+                        exec_builder.add_global(res, 0);
                     }
                     CompiledKernelArgType::ProgramGlobals(_) => {
                         program_globals_binding = Some(exec_builder.resources.len());
@@ -2231,7 +2276,52 @@ impl Kernel {
             ctx.bind_sampler_states(samplers);
             ctx.bind_sampler_views(sviews);
             ctx.bind_shader_images(iviews);
+            let read_addr = |g: *mut u32| -> u64 {
+                if ctx.dev.address_bits() == 64 {
+                    unsafe { g.cast::<u64>().read_unaligned() }
+                } else {
+                    unsafe { g.read_unaligned() }.into()
+                }
+            };
+            let binding_offsets: Vec<u64> = if dev_queues.is_empty() {
+                Vec::new()
+            } else {
+                globals.iter().map(|&g| read_addr(g)).collect()
+            };
             ctx.set_global_binding(resources, &mut globals);
+            // the buffers the kernel has, as (resource, address, size): where the host writes
+            // what kernels it launches for the device ask for (capture_event_profiling_info)
+            let mem_ranges: Vec<(&PipeResource, u64, u64)> = binding_offsets
+                .iter()
+                .enumerate()
+                .map(|(i, &off)| {
+                    (&*resources[i], read_addr(globals[i]) - off, resources[i].width().into())
+                })
+                .collect();
+
+            // A kernel launched by the host starts with empty on-device queues; kernels the host
+            // launches for device-side enqueues keep appending to them.
+            let nested = DEVQ_NESTED.get();
+            if !nested {
+                let mut reset = HashSet::new();
+                for &(res, size, _) in &dev_queues {
+                    if reset.insert(ptr::from_ref(res)) {
+                        let header = DeviceQueue::initial_header(size, size != 0);
+                        ctx.buffer_subdata(res, 0, header.as_ptr().cast(), header.len() as u32);
+                    }
+                }
+            }
+            let dev_queue_addrs: Vec<(&PipeResourceOwned, u64)> = dev_queues
+                .iter()
+                .map(|&(res, _, idx)| {
+                    let addr = if ctx.dev.address_bits() == 64 {
+                        unsafe { globals[idx].cast::<u64>().read_unaligned() }
+                    } else {
+                        unsafe { globals[idx].read_unaligned() }.into()
+                    };
+                    (res, addr)
+                })
+                .collect();
 
             // The binding gave the address of the buffer of the program-scope variables: fill in
             // the addresses in their initial values before the first kernel runs.
@@ -2322,6 +2412,10 @@ impl Kernel {
                 if let Some(pf) = &nir_kernel_build.printf_info {
                     pf.u_printf(buf)
                 }
+            }
+
+            if !nested && !dev_queue_addrs.is_empty() {
+                run_device_enqueues(&prog, cl_ctx, ctx, &dev_queue_addrs, &mem_ranges)?;
             }
 
             Ok(())
@@ -2608,4 +2702,216 @@ fn test_suggest_local_size() {
     println!("avg workgroup fill rate: {}", workgroup_stat / test_runs);
     println!("avg subgroup fill rate: {}", subgroup_stat / test_runs);
     println!("full subgroup rate: {}", full_subgroups as f64 / test_runs);
+}
+
+thread_local! {
+    /// set while the host runs the kernels enqueued on the device by a kernel
+    static DEVQ_NESTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A record a kernel appended to an on-device queue (vtn_handle_device_enqueue)
+struct DevQueueRecord {
+    /// queue index and byte offset of the record in the queue buffer
+    queue: usize,
+    offset: usize,
+    kind: u32,
+    invoke: u32,
+    work_dim: u32,
+    event: u32,
+    waits: Vec<u32>,
+    locals: Vec<u32>,
+    global_offset: [u64; 3],
+    global: [u64; 3],
+    local: [u64; 3],
+    aux: u64,
+    literal: usize,
+}
+
+fn devq_read(
+    ctx: &QueueContextWithState,
+    res: &PipeResourceOwned,
+    offset: usize,
+    size: usize,
+) -> CLResult<Vec<u8>> {
+    let tx = ctx
+        .buffer_map(res, offset as i32, size as i32, RWFlags::RD)
+        .ok_or(CL_OUT_OF_RESOURCES)?;
+    Ok(unsafe { slice::from_raw_parts(tx.ptr().cast::<u8>(), size) }.to_vec())
+}
+
+fn devq_u32(data: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes(data[at..at + 4].try_into().unwrap())
+}
+
+fn devq_u64(data: &[u8], at: usize) -> u64 {
+    u64::from_ne_bytes(data[at..at + 8].try_into().unwrap())
+}
+
+/// Runs the kernels a kernel enqueued on the device, and the ones these enqueue, once it is done:
+/// as the Arm blob does, the host launches them in the order they were enqueued, a record as soon
+/// as the events it waits for are complete. Every enqueue flag is satisfied by running a child
+/// after its parent completed. queues: the on-device queues the kernel had, with their address.
+fn run_device_enqueues(
+    prog: &Arc<Program>,
+    cl_ctx: &Context,
+    ctx: &mut QueueContextWithState,
+    queues: &[(&PipeResourceOwned, u64)],
+    mem: &[(&PipeResource, u64, u64)],
+) -> CLResult<()> {
+    let ptr_size = (ctx.dev.address_bits() / 8) as usize;
+    let mut cursors = vec![0usize; queues.len()];
+    let mut pending: Vec<DevQueueRecord> = Vec::new();
+    // per event (queue, id) done: its execution and completion times in ns
+    let mut done: HashMap<(usize, u32), [u64; 2]> = HashMap::new();
+    let mut kernels: HashMap<u32, Arc<Kernel>> = HashMap::new();
+    let names: HashMap<u32, CString> = prog
+        .build_info()
+        .kernels()
+        .iter()
+        .map(|n| (DeviceQueue::invoke_hash(n.as_bytes()), n.clone()))
+        .collect();
+
+    loop {
+        // user event status, per queue
+        let mut status = Vec::with_capacity(queues.len());
+        for (qi, &(res, _)) in queues.iter().enumerate() {
+            let header = devq_read(ctx, res, 0, DEVQ_SPARE)?;
+            status.push(header[DEVQ_EVENTS..].to_vec());
+            let end = cmp::min(devq_u32(&header, DEVQ_USED), devq_u32(&header, DEVQ_CAPACITY))
+                as usize;
+            if end <= cursors[qi] {
+                continue;
+            }
+            let data = devq_read(ctx, res, DEVQ_RECORDS + cursors[qi], end - cursors[qi])?;
+            let mut at = 0;
+            while at + DEVQ_REC_WAIT <= data.len() {
+                let size = devq_u32(&data, at + DEVQ_REC_SIZE) as usize;
+                if size < DEVQ_REC_WAIT || at + size > data.len() {
+                    break;
+                }
+                let r = &data[at..at + size];
+                let num_events = devq_u32(r, DEVQ_REC_NUM_EVENTS) as usize;
+                let num_locals = devq_u32(r, DEVQ_REC_NUM_LOCALS) as usize;
+                let lists = DEVQ_REC_WAIT + 4 * (num_events + num_locals);
+                if lists > size {
+                    break;
+                }
+                let list = |first: usize, n: usize| {
+                    (0..n)
+                        .map(|i| devq_u32(r, DEVQ_REC_WAIT + 4 * (first + i)))
+                        .collect::<Vec<_>>()
+                };
+                pending.push(DevQueueRecord {
+                    queue: qi,
+                    offset: DEVQ_RECORDS + cursors[qi] + at,
+                    kind: devq_u32(r, DEVQ_REC_KIND),
+                    invoke: devq_u32(r, DEVQ_REC_INVOKE),
+                    work_dim: devq_u32(r, DEVQ_REC_DIM),
+                    event: devq_u32(r, DEVQ_REC_EVENT),
+                    waits: list(0, num_events),
+                    locals: list(num_events, num_locals),
+                    global_offset: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_OFFSET + 8 * i)),
+                    global: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_GLOBAL + 8 * i)),
+                    local: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_LOCAL + 8 * i)),
+                    aux: devq_u64(r, DEVQ_REC_AUX),
+                    literal: lists.next_multiple_of(16),
+                });
+                at += size;
+            }
+            cursors[qi] = end;
+        }
+
+        let mut progress = false;
+        let mut i = 0;
+        while i < pending.len() {
+            let r = &pending[i];
+            let ready = r.waits.iter().all(|&e| {
+                let slot = (e as usize % DEVQ_MAX_EVENTS) * 4;
+                done.contains_key(&(r.queue, e)) || devq_u32(&status[r.queue], slot) != u32::MAX
+            }) && (r.kind != DEVQ_KIND_PROFILING || done.contains_key(&(r.queue, r.event)));
+            if !ready {
+                i += 1;
+                continue;
+            }
+            let r = pending.remove(i);
+            progress = true;
+
+            let mut times = [1u64, 1u64];
+            if r.kind == DEVQ_KIND_PROFILING {
+                // CLK_PROFILING_COMMAND_EXEC_TIME: two u64 at the address the kernel gave
+                let t = done[&(r.queue, r.event)];
+                if let Some(&(res, base, _)) =
+                    mem.iter().find(|&&(_, base, size)| r.aux >= base && r.aux + 16 <= base + size)
+                {
+                    ctx.buffer_subdata_ref(res, (r.aux - base) as u32, t.as_ptr().cast(), 16);
+                }
+                continue;
+            }
+            if r.kind == DEVQ_KIND_KERNEL {
+                let dim = r.work_dim.clamp(1, 3) as usize;
+                let Some(name) = names.get(&r.invoke) else {
+                    continue;
+                };
+                let kernel = match kernels.get(&r.invoke) {
+                    Some(k) => Arc::clone(k),
+                    None => {
+                        let k = Kernel::new(name.clone(), Arc::clone(prog), &prog.build_info());
+                        kernels.insert(r.invoke, Arc::clone(&k));
+                        k
+                    }
+                };
+
+                // the block literal in the record, and the sizes of local memory arguments
+                let literal = queues[r.queue].1 + (r.offset + r.literal) as u64;
+                let mut args: Vec<Option<KernelArgValue>> =
+                    (0..kernel.kernel_info.args.len()).map(|_| None).collect();
+                if let Some(a) = args.first_mut() {
+                    *a = Some(KernelArgValue::Constant(
+                        literal.to_ne_bytes()[..ptr_size].to_vec(),
+                    ));
+                }
+                for (a, &size) in args.iter_mut().skip(1).zip(&r.locals) {
+                    *a = Some(KernelArgValue::LocalMem(size as usize));
+                }
+
+                let global = r.global.map(|v| v as usize);
+                let offsets = r.global_offset.map(|v| v as usize);
+                let local = r.local.map(|v| v as usize);
+                if global[..dim].contains(&0) {
+                    continue;
+                }
+                let local: &[usize] = if local[..dim].contains(&0) {
+                    &[0; 3]
+                } else {
+                    &local[..dim]
+                };
+                let launch = kernel.launch_with_args(
+                    ctx.dev,
+                    dim as u32,
+                    local,
+                    &global[..dim],
+                    &offsets[..dim],
+                    args,
+                )?;
+                let start = std::time::Instant::now();
+                DEVQ_NESTED.set(true);
+                let res = launch(cl_ctx, ctx);
+                DEVQ_NESTED.set(false);
+                res?;
+                ctx.flush().wait();
+                let ns = (start.elapsed().as_nanos() as u64).max(1);
+                times = [ns, ns];
+            }
+            if r.event != 0 {
+                done.insert((r.queue, r.event), times);
+                let slot = DEVQ_TIMES + 16 * (r.event as usize % DEVQ_MAX_EVENTS);
+                ctx.buffer_subdata(queues[r.queue].0, slot as u32, times.as_ptr().cast(), 16);
+            }
+        }
+
+        if !progress {
+            // anything left waits for events that never complete
+            return Ok(());
+        }
+    }
 }

@@ -83,6 +83,9 @@ rusticl_lower_intrinsics_instr(
     case nir_intrinsic_load_global_base_ptr:
         /* program-scope global variables: the buffer of the program */
         return nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->program_globals_loc));
+    case nir_intrinsic_load_default_queue_cl:
+        /* device-side enqueue: the buffer of the default on-device queue */
+        return nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->default_queue_loc));
     case nir_intrinsic_load_constant_base_ptr:
         return nir_load_var(b, nir_find_variable_with_location(b->shader, nir_var_uniform, state->const_buf_loc));
     case nir_intrinsic_load_printf_buffer_address:
@@ -843,6 +846,24 @@ rusticl_has_global_pointer_initializers(nir_shader *nir)
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_global) {
       if (var->pointer_initializer)
          return true;
+   }
+   return false;
+}
+
+/* Whether the kernel can enqueue kernels or reads the default on-device
+ * queue (vtn_handle_device_enqueue)
+ */
+bool
+rusticl_uses_default_queue(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_default_queue_cl)
+               return true;
+         }
+      }
    }
    return false;
 }

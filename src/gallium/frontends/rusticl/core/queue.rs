@@ -15,6 +15,8 @@ use mesa_rust::pipe::context::PipeContext;
 use mesa_rust::pipe::context::PipeContextPrio;
 use mesa_rust::pipe::fence::PipeFence;
 use mesa_rust::pipe::resource::PipeImageView;
+use mesa_rust::pipe::resource::PipeResourceOwned;
+use mesa_rust::pipe::screen::ResourceType;
 use mesa_rust::pipe::resource::PipeSamplerView;
 use mesa_rust_gen::*;
 use mesa_rust_util::properties::*;
@@ -34,6 +36,83 @@ use std::sync::Mutex;
 use std::sync::Weak;
 use std::thread;
 use std::thread::JoinHandle;
+
+/// OpenCL 2.0 on-device queue: kernels append records to its buffer (layout in
+/// spirv/vtn_opencl.c, vtn_handle_device_enqueue), the host launches them after the kernel.
+pub struct DeviceQueue {
+    pub res: Arc<PipeResourceOwned>,
+    /// bytes for records
+    pub size: u32,
+}
+
+pub const DEVQ_USED: usize = 0;
+pub const DEVQ_CAPACITY: usize = 4;
+pub const DEVQ_NEXT_EVENT: usize = 8;
+pub const DEVQ_VALID: usize = 12;
+pub const DEVQ_EVENTS: usize = 256;
+pub const DEVQ_MAX_EVENTS: usize = 1024;
+pub const DEVQ_SPARE: usize = DEVQ_EVENTS + 4 * DEVQ_MAX_EVENTS;
+pub const DEVQ_SPARE_SIZE: usize = 4096;
+/// per event the u64 execution and completion times in ns once its kernel is done
+pub const DEVQ_TIMES: usize = DEVQ_SPARE + DEVQ_SPARE_SIZE;
+pub const DEVQ_RECORDS: usize = DEVQ_TIMES + 16 * DEVQ_MAX_EVENTS;
+
+pub const DEVQ_REC_SIZE: usize = 0;
+pub const DEVQ_REC_KIND: usize = 4;
+pub const DEVQ_REC_INVOKE: usize = 8;
+pub const DEVQ_REC_DIM: usize = 16;
+pub const DEVQ_REC_EVENT: usize = 20;
+pub const DEVQ_REC_NUM_EVENTS: usize = 24;
+pub const DEVQ_REC_NUM_LOCALS: usize = 28;
+pub const DEVQ_REC_OFFSET: usize = 32;
+pub const DEVQ_REC_GLOBAL: usize = 56;
+pub const DEVQ_REC_LOCAL: usize = 80;
+pub const DEVQ_REC_PARAM_SIZE: usize = 104;
+pub const DEVQ_REC_AUX: usize = 112;
+pub const DEVQ_REC_WAIT: usize = 128;
+
+pub const DEVQ_KIND_KERNEL: u32 = 1;
+pub const DEVQ_KIND_MARKER: u32 = 2;
+pub const DEVQ_KIND_PROFILING: u32 = 3;
+
+impl DeviceQueue {
+    pub fn new(dev: &Device, size: u32) -> CLResult<Self> {
+        let res = Self::create_buffer(dev, size)?;
+        Ok(Self {
+            res: Arc::new(res),
+            size: size,
+        })
+    }
+
+    pub fn create_buffer(dev: &Device, size: u32) -> CLResult<PipeResourceOwned> {
+        dev.screen()
+            .resource_create_buffer(
+                DEVQ_RECORDS as u32 + size,
+                ResourceType::Normal,
+                PIPE_BIND_GLOBAL,
+                0,
+            )
+            .ok_or(CL_OUT_OF_RESOURCES)
+    }
+
+    /// The header and event table of a queue with no records: written before a kernel that can
+    /// enqueue runs. An invalid queue (the stand-in when there is no default queue) takes no
+    /// records.
+    pub fn initial_header(size: u32, valid: bool) -> Vec<u8> {
+        let mut data = vec![0u8; DEVQ_RECORDS];
+        data[DEVQ_CAPACITY..DEVQ_CAPACITY + 4].copy_from_slice(&size.to_ne_bytes());
+        data[DEVQ_NEXT_EVENT..DEVQ_NEXT_EVENT + 4].copy_from_slice(&1u32.to_ne_bytes());
+        data[DEVQ_VALID..DEVQ_VALID + 4].copy_from_slice(&u32::from(valid).to_ne_bytes());
+        data[DEVQ_EVENTS..DEVQ_SPARE].fill(0xff);
+        data
+    }
+
+    /// FNV-1a of a block kernel's name, as vtn_devq_invoke_hash
+    pub fn invoke_hash(name: &[u8]) -> u32 {
+        name.iter()
+            .fold(2166136261u32, |h, &c| (h ^ c as u32).wrapping_mul(16777619))
+    }
+}
 
 struct CSOWrapper<'a> {
     ctx: &'a PipeContext,
@@ -265,6 +344,8 @@ pub struct Queue {
     pub device: &'static Device,
     pub props: cl_command_queue_properties,
     pub props_v2: Properties<cl_queue_properties>,
+    /// set for on-device queues (CL_QUEUE_ON_DEVICE)
+    pub dev_queue: Option<DeviceQueue>,
     state: Mutex<QueueState>,
     _thread_worker: JoinHandle<()>,
     _thrd_signal: JoinHandle<()>,
@@ -370,6 +451,7 @@ impl Queue {
         device: &'static Device,
         props: cl_command_queue_properties,
         props_v2: Properties<cl_queue_properties>,
+        dev_queue: Option<DeviceQueue>,
     ) -> CLResult<Arc<Queue>> {
         // If CL_QUEUE_PRIORITY_KHR is not specified, the default priority CL_QUEUE_PRIORITY_MED_KHR
         // is used.
@@ -394,6 +476,7 @@ impl Queue {
             device: device,
             props: props,
             props_v2: props_v2,
+            dev_queue: dev_queue,
             state: Mutex::new(QueueState {
                 pending: Vec::new(),
                 last: Weak::new(),

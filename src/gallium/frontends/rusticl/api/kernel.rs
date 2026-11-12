@@ -438,7 +438,16 @@ fn set_kernel_arg(
         };
 
         // let's create the arg now
-        let arg = match arg.kind {
+        let arg = if arg.is_queue() {
+            // CL_INVALID_DEVICE_QUEUE for an argument declared to be of type queue_t when the
+            // specified arg_value is not a valid device queue object.
+            let q: *const cl_command_queue = arg_value.cast();
+            // SAFETY: arg_value points to a cl_command_queue (size checked above).
+            let q = Queue::arc_from_raw(unsafe { *q }).or(Err(CL_INVALID_DEVICE_QUEUE))?;
+            let dq = q.dev_queue.as_ref().ok_or(CL_INVALID_DEVICE_QUEUE)?;
+            KernelArgValue::DevQueue(Arc::clone(&dq.res), dq.size)
+        } else {
+            match arg.kind {
             KernelArgType::Constant(_) if !arg.dead => KernelArgValue::Constant(
                 // SAFETY: for constant args arg_value points to raw data.
                 unsafe { slice::from_raw_parts(arg_value.cast(), arg_size) }.to_vec(),
@@ -503,6 +512,7 @@ fn set_kernel_arg(
                         )
                 );
                 KernelArgValue::None
+            }
             }
         };
         k.set_kernel_arg(arg_index, arg)

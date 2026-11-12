@@ -331,7 +331,11 @@ impl PipeResource {
         this.as_mut_ptr().cast()
     }
 
-    fn as_mut_ptr(&self) -> *mut pipe_resource {
+    pub fn width(&self) -> u32 {
+        self.0.width0
+    }
+
+    pub(super) fn as_mut_ptr(&self) -> *mut pipe_resource {
         (&self.0 as *const pipe_resource).cast_mut()
     }
 

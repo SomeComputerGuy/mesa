@@ -19,6 +19,7 @@ struct rusticl_lower_state {
     size_t shared_size_loc;
     size_t enqueued_local_size_loc;
     size_t program_globals_loc;
+    size_t default_queue_loc;
 };
 
 bool rusticl_lower_intrinsics(nir_shader *nir, struct rusticl_lower_state *state);
@@ -47,3 +48,4 @@ unsigned rusticl_gather_global_relocs(nir_shader *nir, struct rusticl_global_rel
                                       unsigned max);
 bool rusticl_has_global_pointer_initializers(nir_shader *nir);
 bool rusticl_lower_pipes(nir_shader *nir);
+bool rusticl_uses_default_queue(nir_shader *nir);

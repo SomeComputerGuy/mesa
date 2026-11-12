@@ -28,15 +28,23 @@ unsafe impl CLInfo<cl_command_queue_info> for cl_command_queue {
                 v.write::<cl_context>(cl_context::from_ptr(ptr))
             }
             CL_QUEUE_DEVICE => v.write::<cl_device_id>(cl_device_id::from_ptr(queue.device)),
-            CL_QUEUE_DEVICE_DEFAULT => v.write::<cl_command_queue>(ptr::null_mut()),
+            CL_QUEUE_DEVICE_DEFAULT => {
+                // Note we use as_ptr here which doesn't increase the reference count.
+                let def = queue.context.default_device_queue(queue.device);
+                v.write::<cl_command_queue>(
+                    def.map_or(ptr::null_mut(), |q| cl_command_queue::from_ptr(Arc::as_ptr(&q))),
+                )
+            }
             CL_QUEUE_PROPERTIES => v.write::<cl_command_queue_properties>(queue.props),
             CL_QUEUE_PROPERTIES_ARRAY => {
                 v.write::<&Properties<cl_queue_properties>>(&queue.props_v2)
             }
             CL_QUEUE_REFERENCE_COUNT => v.write::<cl_uint>(Queue::refcnt(*self)?),
-            // clGetCommandQueueInfo, passing CL_QUEUE_SIZE Returns CL_INVALID_COMMAND_QUEUE since
-            // command_queue cannot be a valid device command-queue.
-            CL_QUEUE_SIZE => Err(CL_INVALID_COMMAND_QUEUE),
+            // CL_INVALID_COMMAND_QUEUE for a host command-queue
+            CL_QUEUE_SIZE => match &queue.dev_queue {
+                Some(dq) => v.write::<cl_uint>(dq.size),
+                None => Err(CL_INVALID_COMMAND_QUEUE),
+            },
             // CL_INVALID_VALUE if param_name is not one of the supported values
             _ => Err(CL_INVALID_VALUE),
         }
@@ -78,7 +86,13 @@ fn supported_command_queue_properties(
         valid_flags |= CL_QUEUE_PROFILING_ENABLE;
     }
 
-    // add on device queue properties here once supported and called from `clCreateCommandQueueWithProperties`
+    if dev.device_enqueue_supported() {
+        valid_flags |= CL_QUEUE_ON_DEVICE | CL_QUEUE_ON_DEVICE_DEFAULT;
+        // the host times the kernels of on-device queues (capture_event_profiling_info)
+        if properties & cl_bitfield::from(CL_QUEUE_ON_DEVICE) != 0 {
+            valid_flags |= CL_QUEUE_PROFILING_ENABLE;
+        }
+    }
 
     if properties & !cl_bitfield::from(valid_flags) != 0 {
         return false;
@@ -92,6 +106,7 @@ pub fn create_command_queue_impl(
     device: cl_device_id,
     properties: cl_command_queue_properties,
     properties_v2: Properties<cl_queue_properties>,
+    queue_size: Option<u32>,
 ) -> CLResult<cl_command_queue> {
     let c = Context::arc_from_raw(context)?;
     let d = Device::ref_from_raw(device)?
@@ -113,7 +128,36 @@ pub fn create_command_queue_impl(
         return Err(CL_INVALID_QUEUE_PROPERTIES);
     }
 
-    Ok(Queue::new(c, d, properties, properties_v2)?.into_cl())
+    let on_device = bit_check(properties, CL_QUEUE_ON_DEVICE);
+    // CL_INVALID_VALUE: an on-device queue is out of order; the default one is on the device; a
+    // size only for an on-device queue, at most CL_DEVICE_QUEUE_ON_DEVICE_MAX_SIZE
+    if (on_device && !bit_check(properties, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE))
+        || (!on_device && bit_check(properties, CL_QUEUE_ON_DEVICE_DEFAULT))
+        || (!on_device && queue_size.is_some())
+        || queue_size.is_some_and(|s| s > d.queue_on_device_max_size())
+    {
+        return Err(CL_INVALID_VALUE);
+    }
+
+    if !on_device {
+        return Ok(Queue::new(c, d, properties, properties_v2, None)?.into_cl());
+    }
+
+    // one on-device queue per device: the default one (CL_DEVICE_MAX_ON_DEVICE_QUEUES 1)
+    if let Some(q) = c.default_device_queue(d) {
+        if bit_check(properties, CL_QUEUE_ON_DEVICE_DEFAULT) {
+            return Ok(q.into_cl());
+        }
+        return Err(CL_OUT_OF_RESOURCES);
+    }
+
+    let size = queue_size.unwrap_or(d.queue_on_device_preferred_size());
+    let dq = DeviceQueue::new(d, size)?;
+    let q = Queue::new(Arc::clone(&c), d, properties, properties_v2, Some(dq))?;
+    if bit_check(properties, CL_QUEUE_ON_DEVICE_DEFAULT) {
+        c.set_default_device_queue(d, &q);
+    }
+    Ok(q.into_cl())
 }
 
 #[cl_entrypoint(clCreateCommandQueue)]
@@ -122,7 +166,7 @@ fn create_command_queue(
     device: cl_device_id,
     properties: cl_command_queue_properties,
 ) -> CLResult<cl_command_queue> {
-    create_command_queue_impl(context, device, properties, Properties::default())
+    create_command_queue_impl(context, device, properties, Properties::default(), None)
 }
 
 #[cl_entrypoint(clCreateCommandQueueWithProperties)]
@@ -132,6 +176,7 @@ fn create_command_queue_with_properties(
     properties: *const cl_queue_properties,
 ) -> CLResult<cl_command_queue> {
     let mut queue_properties = cl_command_queue_properties::default();
+    let mut queue_size = None;
     let d = Device::ref_from_raw(device)?;
 
     // SAFETY: properties is a 0 terminated array by spec.
@@ -151,12 +196,15 @@ fn create_command_queue_with_properties(
             }
             // CL_INVALID_QUEUE_PROPERTIES if values specified in properties are valid but are not
             // supported by the device.
-            CL_QUEUE_SIZE => return Err(CL_INVALID_QUEUE_PROPERTIES),
+            CL_QUEUE_SIZE if !d.device_enqueue_supported() => {
+                return Err(CL_INVALID_QUEUE_PROPERTIES)
+            }
+            CL_QUEUE_SIZE => queue_size = Some(u32::try_from(val).or(Err(CL_INVALID_VALUE))?),
             _ => return Err(CL_INVALID_VALUE),
         }
     }
 
-    create_command_queue_impl(context, device, queue_properties, properties)
+    create_command_queue_impl(context, device, queue_properties, properties, queue_size)
 }
 
 #[cl_entrypoint(clEnqueueMarker)]
