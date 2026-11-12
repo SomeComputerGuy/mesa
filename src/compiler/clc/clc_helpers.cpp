@@ -25,7 +25,10 @@
 
 #include <cstdlib>
 #include <sstream>
+#include <map>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/IR/DiagnosticPrinter.h>
@@ -77,6 +80,7 @@
 #include "util/ralloc.h"
 #include "util/set.h"
 #include "util/u_dl.h"
+#include "util/u_math.h"
 #include "glsl_types.h"
 
 #include "spirv.h"
@@ -1379,6 +1383,372 @@ const char* clc_spirv_tools_version() {
    return spvSoftwareVersionString();
 }
 
+/* clang makes the padding of an initialized C struct explicit (zero [N x i8]
+ * or i8 members, C23 zero padding), so the definition of a program-scope
+ * variable has a literal struct type such as { i8, [3 x i8], i32 } while an
+ * `extern` declaration of it in another compilation unit uses the struct
+ * type of the source, { i8, i32 }. spirv-link refuses the type mismatch.
+ * Before linking, the padding members of such definitions are dropped where
+ * that gives the type of an importing module with the same OpenCL layout.
+ */
+namespace {
+
+struct spv_mod {
+   std::vector<std::vector<uint32_t>> insts;
+   std::unordered_map<uint32_t, size_t> defs;     /* result id -> inst */
+   std::unordered_map<uint32_t, uint32_t> types;  /* result id -> type id */
+   std::map<std::string, uint32_t> exports, imports; /* variables */
+   unsigned ptr_size = 8;
+   /* struct type id -> members to drop */
+   std::unordered_map<uint32_t, std::vector<bool>> drop;
+
+   const std::vector<uint32_t> *def(uint32_t id) const
+   {
+      auto it = defs.find(id);
+      return it == defs.end() ? nullptr : &insts[it->second];
+   }
+};
+
+spv_result_t
+spv_mod_parse_inst(void *data, const spv_parsed_instruction_t *ins)
+{
+   spv_mod *m = static_cast<spv_mod *>(data);
+   m->insts.emplace_back(ins->words, ins->words + ins->num_words);
+   if (ins->result_id) {
+      m->defs[ins->result_id] = m->insts.size() - 1;
+      m->types[ins->result_id] = ins->type_id;
+   }
+   if (ins->opcode == SpvOpMemoryModel)
+      m->ptr_size = ins->words[1] == SpvAddressingModelPhysical32 ? 4 : 8;
+   return SPV_SUCCESS;
+}
+
+bool
+spv_mod_parse(spv_mod &m, const std::vector<uint32_t> &bin)
+{
+   spv_context ctx = spvContextCreate(spirv_target);
+   spv_result_t res = spvBinaryParse(ctx, &m, bin.data(), bin.size(), NULL,
+                                     spv_mod_parse_inst, NULL);
+   spvContextDestroy(ctx);
+   if (res != SPV_SUCCESS)
+      return false;
+
+   for (const auto &w : m.insts) {
+      if ((w[0] & SpvOpCodeMask) != SpvOpDecorate || w.size() < 4 ||
+          w[2] != SpvDecorationLinkageAttributes)
+         continue;
+      const auto *var = m.def(w[1]);
+      if (!var || ((*var)[0] & SpvOpCodeMask) != SpvOpVariable)
+         continue;
+      std::string name(reinterpret_cast<const char *>(&w[3]));
+      uint32_t kind = w.back();
+      if (kind == SpvLinkageTypeExport)
+         m.exports[name] = w[1];
+      else if (kind == SpvLinkageTypeImport)
+         m.imports[name] = w[1];
+   }
+   return true;
+}
+
+/* The value of an integer constant, or -1 */
+int64_t
+spv_mod_const(const spv_mod &m, uint32_t id)
+{
+   const auto *c = m.def(id);
+   if (!c || ((*c)[0] & SpvOpCodeMask) != SpvOpConstant || c->size() < 4)
+      return -1;
+   uint64_t v = (*c)[3];
+   if (c->size() > 4)
+      v |= uint64_t((*c)[4]) << 32;
+   return v;
+}
+
+/* OpenCL size and alignment of a type, false for types that are not data */
+bool
+spv_type_layout(const spv_mod &m, uint32_t id, uint64_t &size, uint64_t &align,
+                unsigned depth = 0)
+{
+   const auto *t = m.def(id);
+   if (!t || depth > 32)
+      return false;
+   const auto &w = *t;
+   switch (w[0] & SpvOpCodeMask) {
+   case SpvOpTypeInt:
+   case SpvOpTypeFloat:
+      size = align = w[2] / 8;
+      return size != 0;
+   case SpvOpTypePointer:
+      size = align = m.ptr_size;
+      return true;
+   case SpvOpTypeVector: {
+      uint64_t es, ea;
+      if (!spv_type_layout(m, w[2], es, ea, depth + 1))
+         return false;
+      size = align = es * (w[3] == 3 ? 4 : w[3]);
+      return true;
+   }
+   case SpvOpTypeArray: {
+      int64_t len = spv_mod_const(m, w[3]);
+      if (len < 0 || !spv_type_layout(m, w[2], size, align, depth + 1))
+         return false;
+      size *= len;
+      return true;
+   }
+   case SpvOpTypeStruct: {
+      size = 0;
+      align = 1;
+      for (size_t i = 2; i < w.size(); i++) {
+         uint64_t ms, ma;
+         if (!spv_type_layout(m, w[i], ms, ma, depth + 1))
+            return false;
+         size = align64(size, ma) + ms;
+         align = MAX2(align, ma);
+      }
+      size = align64(size, align);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+bool
+spv_types_same(const spv_mod &a, uint32_t ta, const spv_mod &b, uint32_t tb,
+               unsigned depth = 0)
+{
+   const auto *pa = a.def(ta), *pb = b.def(tb);
+   if (!pa || !pb || depth > 32)
+      return false;
+   const auto &wa = *pa, &wb = *pb;
+   if (wa[0] != wb[0])
+      return false;
+   switch (wa[0] & SpvOpCodeMask) {
+   case SpvOpTypeInt:
+   case SpvOpTypeFloat:
+      return std::equal(wa.begin() + 2, wa.end(), wb.begin() + 2);
+   case SpvOpTypeVector:
+      return wa[3] == wb[3] && spv_types_same(a, wa[2], b, wb[2], depth + 1);
+   case SpvOpTypeArray: {
+      int64_t la = spv_mod_const(a, wa[3]);
+      return la >= 0 && la == spv_mod_const(b, wb[3]) &&
+             spv_types_same(a, wa[2], b, wb[2], depth + 1);
+   }
+   case SpvOpTypePointer:
+      return wa[2] == wb[2] && spv_types_same(a, wa[3], b, wb[3], depth + 1);
+   case SpvOpTypeStruct:
+      for (size_t i = 2; i < wa.size(); i++) {
+         if (!spv_types_same(a, wa[i], b, wb[i], depth + 1))
+            return false;
+      }
+      return true;
+   default:
+      /* other types: same opcode and operands is close enough */
+      return wa.size() == 2;
+   }
+}
+
+/* A padding member clang inserts: i8 or [N x i8] */
+bool
+spv_type_is_padding(const spv_mod &m, uint32_t id)
+{
+   const auto *t = m.def(id);
+   if (!t)
+      return false;
+   if (((*t)[0] & SpvOpCodeMask) == SpvOpTypeArray)
+      t = m.def((*t)[2]);
+   return t && ((*t)[0] & SpvOpCodeMask) == SpvOpTypeInt && (*t)[2] == 8;
+}
+
+/* Finds the padding members of the exporter's type te that make it the
+ * importer's type ti (with the same layout), recorded in e.drop.
+ */
+bool
+spv_match_padded(spv_mod &e, uint32_t te, const spv_mod &i, uint32_t ti,
+                 unsigned depth = 0)
+{
+   if (spv_types_same(e, te, i, ti))
+      return true;
+   const auto *pe = e.def(te), *pi = i.def(ti);
+   if (!pe || !pi || depth > 32)
+      return false;
+   const auto we = *pe, wi = *pi;
+   SpvOp op = SpvOp(we[0] & SpvOpCodeMask);
+   if (op != SpvOp(wi[0] & SpvOpCodeMask))
+      return false;
+
+   if (op == SpvOpTypeArray) {
+      int64_t len = spv_mod_const(e, we[3]);
+      return len >= 0 && len == spv_mod_const(i, wi[3]) &&
+             spv_match_padded(e, we[2], i, wi[2], depth + 1);
+   }
+   if (op != SpvOpTypeStruct)
+      return false;
+
+   uint64_t size_e, align_e, size_i, align_i;
+   if (!spv_type_layout(e, te, size_e, align_e) ||
+       !spv_type_layout(i, ti, size_i, align_i) ||
+       size_e != size_i || align_e != align_i)
+      return false;
+
+   /* Greedy: a member that does not match the next importer member must be
+    * padding. Padding is followed by a member aligned to more than a byte,
+    * so it never matches that member itself. Offsets are checked as well.
+    */
+   std::vector<bool> drop(we.size() - 2);
+   uint64_t off_e = 0, off_i = 0;
+   size_t j = 2;
+   for (size_t k = 2; k < we.size(); k++) {
+      uint64_t ms, ma;
+      if (!spv_type_layout(e, we[k], ms, ma))
+         return false;
+      off_e = align64(off_e, ma);
+      if (j < wi.size()) {
+         uint64_t is, ia;
+         if (!spv_type_layout(i, wi[j], is, ia))
+            return false;
+         uint64_t at = align64(off_i, ia);
+         if (at == off_e && spv_match_padded(e, we[k], i, wi[j], depth + 1)) {
+            off_i = at + is;
+            off_e += ms;
+            j++;
+            continue;
+         }
+      }
+      if (!spv_type_is_padding(e, we[k]))
+         return false;
+      drop[k - 2] = true;
+      off_e += ms;
+   }
+   if (j != wi.size())
+      return false;
+
+   auto it = e.drop.find(te);
+   if (it != e.drop.end())
+      return it->second == drop;
+   e.drop[te] = drop;
+   return true;
+}
+
+/* Drops the members in m.drop from the struct types and their constants.
+ * Returns false (nothing changed) if they are used in any other way.
+ */
+bool
+spv_mod_drop_padding(spv_mod &m)
+{
+   auto is_dropped = [&](uint32_t type) { return m.drop.count(type) != 0; };
+   auto pointee_dropped = [&](uint32_t value) {
+      const auto *t = m.def(m.types.count(value) ? m.types[value] : 0);
+      return t && ((*t)[0] & SpvOpCodeMask) == SpvOpTypePointer &&
+             is_dropped((*t)[3]);
+   };
+
+   for (const auto &w : m.insts) {
+      switch (w[0] & SpvOpCodeMask) {
+      case SpvOpMemberDecorate:
+      case SpvOpMemberName:
+         if (is_dropped(w[1]))
+            return false;
+         break;
+      case SpvOpAccessChain:
+      case SpvOpInBoundsAccessChain:
+      case SpvOpPtrAccessChain:
+      case SpvOpInBoundsPtrAccessChain:
+         if (pointee_dropped(w[3]))
+            return false;
+         break;
+      case SpvOpSpecConstantOp:
+         if ((w[3] == SpvOpAccessChain || w[3] == SpvOpInBoundsAccessChain ||
+              w[3] == SpvOpPtrAccessChain ||
+              w[3] == SpvOpInBoundsPtrAccessChain) &&
+             pointee_dropped(w[4]))
+            return false;
+         break;
+      case SpvOpCompositeExtract:
+         if (is_dropped(m.types[w[3]]))
+            return false;
+         break;
+      case SpvOpCompositeInsert:
+         if (is_dropped(m.types[w[4]]))
+            return false;
+         break;
+      case SpvOpCompositeConstruct:
+         if (is_dropped(w[1]))
+            return false;
+         break;
+      default:
+         break;
+      }
+   }
+
+   for (auto &w : m.insts) {
+      SpvOp op = SpvOp(w[0] & SpvOpCodeMask);
+      const std::vector<bool> *drop;
+      size_t first;
+      if (op == SpvOpTypeStruct && is_dropped(w[1])) {
+         drop = &m.drop[w[1]];
+         first = 2;
+      } else if ((op == SpvOpConstantComposite ||
+                  op == SpvOpSpecConstantComposite) && is_dropped(w[1])) {
+         drop = &m.drop[w[1]];
+         first = 3;
+      } else {
+         continue;
+      }
+      if (w.size() - first != drop->size())
+         return false;
+      std::vector<uint32_t> nw(w.begin(), w.begin() + first);
+      for (size_t k = 0; k < drop->size(); k++) {
+         if (!(*drop)[k])
+            nw.push_back(w[first + k]);
+      }
+      nw[0] = (uint32_t(nw.size()) << SpvWordCountShift) | op;
+      w = std::move(nw);
+   }
+   return true;
+}
+
+void
+clc_match_padded_variables(std::vector<std::vector<uint32_t>> &binaries)
+{
+   std::vector<spv_mod> mods(binaries.size());
+   for (size_t n = 0; n < binaries.size(); n++) {
+      if (!spv_mod_parse(mods[n], binaries[n]))
+         return;
+   }
+
+   for (size_t ie = 0; ie < mods.size(); ie++) {
+      spv_mod &e = mods[ie];
+      for (const auto &exp : e.exports) {
+         for (size_t ii = 0; ii < mods.size(); ii++) {
+            const spv_mod &i = mods[ii];
+            auto imp = i.imports.find(exp.first);
+            if (ii == ie || imp == i.imports.end())
+               continue;
+            const auto *pe = e.def(e.types[exp.second]);
+            const auto *pi = i.def(i.types.at(imp->second));
+            if (!pe || !pi || ((*pe)[0] & SpvOpCodeMask) != SpvOpTypePointer ||
+                ((*pi)[0] & SpvOpCodeMask) != SpvOpTypePointer ||
+                (*pe)[2] != (*pi)[2])
+               continue;
+            /* on failure, the linker reports the mismatch */
+            spv_match_padded(e, (*pe)[3], i, (*pi)[3]);
+         }
+      }
+   }
+
+   for (size_t n = 0; n < mods.size(); n++) {
+      spv_mod &m = mods[n];
+      if (m.drop.empty() || !spv_mod_drop_padding(m))
+         continue;
+      std::vector<uint32_t> bin(binaries[n].begin(), binaries[n].begin() + 5);
+      for (const auto &w : m.insts)
+         bin.insert(bin.end(), w.begin(), w.end());
+      binaries[n] = std::move(bin);
+   }
+}
+
+} /* namespace */
+
 int
 clc_link_spirv_binaries(const struct clc_linker_args *args,
                         const struct clc_logger *logger,
@@ -1391,6 +1761,8 @@ clc_link_spirv_binaries(const struct clc_linker_args *args,
       std::vector<uint32_t> bin(data, data + (args->in_objs[i]->size / 4));
       binaries.push_back(bin);
    }
+
+   clc_match_padded_variables(binaries);
 
    SPIRVMessageConsumer msgconsumer(logger);
    spvtools::Context context(spirv_target);
