@@ -79,6 +79,7 @@ static const struct spirv_capabilities implemented_capabilities = {
    .DotProductInput4x8Bit = true,
    .DotProductInput4x8BitPacked = true,
    .DotProductInputAll = true,
+   .DeviceEnqueue = true,
    .DrawParameters = true,
    .ExpectAssumeKHR = true,
    .Float8EXT = true,
@@ -2583,8 +2584,20 @@ vtn_handle_type(struct vtn_builder *b, SpvOp opcode,
       val->type->type = glsl_uint64_t_type();
       break;
 
-   case SpvOpTypeDeviceEvent:
    case SpvOpTypeQueue:
+      /* OpenCL on-device queue: the global address of its buffer
+       * (vtn_handle_device_enqueue)
+       */
+      val->type->base_type = vtn_base_type_scalar;
+      val->type->type = glsl_uint64_t_type();
+      break;
+
+   case SpvOpTypeDeviceEvent:
+      /* OpenCL device-side event: an id in the queue, 0 = none */
+      val->type->base_type = vtn_base_type_scalar;
+      val->type->type = glsl_uint64_t_type();
+      break;
+
    default:
       vtn_fail_with_opcode("Unhandled opcode", opcode);
    }
@@ -5869,6 +5882,7 @@ vtn_handle_entry_point(struct vtn_builder *b, const uint32_t *w,
    /* Let this be a name label regardless */
    unsigned name_words;
    entry_point->name = vtn_string_literal(b, &w[3], count - 3, &name_words);
+   entry_point->entry_point_name = entry_point->name;
    entry_point->is_entrypoint = true;
 
    mesa_shader_stage stage = vtn_stage_for_execution_model(w[1]);
@@ -7739,6 +7753,21 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
       vtn_handle_pipe(b, opcode, w, count);
       break;
 
+   case SpvOpEnqueueMarker:
+   case SpvOpEnqueueKernel:
+   case SpvOpGetKernelWorkGroupSize:
+   case SpvOpGetKernelPreferredWorkGroupSizeMultiple:
+   case SpvOpRetainEvent:
+   case SpvOpReleaseEvent:
+   case SpvOpCreateUserEvent:
+   case SpvOpIsValidEvent:
+   case SpvOpSetUserEventStatus:
+   case SpvOpCaptureEventProfilingInfo:
+   case SpvOpGetDefaultQueue:
+   case SpvOpBuildNDRange:
+      vtn_handle_device_enqueue(b, opcode, w, count);
+      break;
+
    case SpvOpWritePackedPrimitiveIndices4x8NV:
       vtn_handle_write_packed_primitive_indices(b, opcode, w, count);
       break;
@@ -8022,6 +8051,17 @@ vtn_emit_kernel_entry_point_wrapper(struct vtn_builder *b,
          nir_deref_instr *deref = nir_build_deref_var(&b->nb, in_var);
          vtn_emit_kernel_entry_point_wrapper_struct_param(&b->nb, deref, call,
                                                           &call_idx);
+      } else if (param_type->base_type == vtn_base_type_pointer &&
+                 param_type->storage_class == SpvStorageClassGeneric) {
+         /* Only the kernels of OpenCL blocks take a generic pointer: their
+          * block literal, which the frontend places in global memory (see
+          * vtn_handle_device_enqueue). Starting from a global deref lets
+          * nir_opt_deref resolve every access through it.
+          */
+         nir_deref_instr *cast =
+            nir_build_deref_cast(&b->nb, nir_load_var(&b->nb, in_var),
+                                 nir_var_mem_global, param_type->pointed->type, 0);
+         call->params[call_idx++] = nir_src_for_ssa(&cast->def);
       } else {
          call->params[call_idx++] =
             nir_src_for_ssa(nir_load_var(&b->nb, in_var));

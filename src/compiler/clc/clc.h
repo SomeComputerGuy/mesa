@@ -75,6 +75,7 @@ struct clc_optional_features {
    bool kernel_clock;
    bool program_scope_global_variables;
    bool pipes;
+   bool device_enqueue;
    /* OpenCL core subgroups */
    bool subgroups;
    /* OpenCL extension cl_khr_subgroups, which requires independent forward

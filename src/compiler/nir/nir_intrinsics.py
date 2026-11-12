@@ -673,6 +673,12 @@ intrinsic("workgroup_broadcast", src_comp=[1, 3], dest_comp=1, bit_sizes=src0)
 intrinsic("pipe_reserve_read", src_comp=[1, 1], dest_comp=1, indices=[EXECUTION_SCOPE], bit_sizes=[64])
 intrinsic("pipe_reserve_write", src_comp=[1, 1], dest_comp=1, indices=[EXECUTION_SCOPE], bit_sizes=[64])
 
+# OpenCL device-side enqueue: the global address of the buffer of the default
+# on-device queue of the launch (always a valid buffer, see
+# vtn_handle_device_enqueue)
+intrinsic("load_default_queue_cl", dest_comp=1, bit_sizes=[64],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # AMD shader ballot operations
 intrinsic("quad_swizzle_amd", src_comp=[0], dest_comp=0, bit_sizes=src0,
           indices=[SWIZZLE_MASK, FETCH_INACTIVE],

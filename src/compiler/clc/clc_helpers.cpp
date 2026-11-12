@@ -1012,6 +1012,9 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
    if (args->features.pipes) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_pipes");
    }
+   if (args->features.device_enqueue) {
+      c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_device_enqueue");
+   }
    if (args->features.program_scope_global_variables) {
       c->getTargetOpts().OpenCLExtensionsAsWritten.push_back("+__opencl_c_program_scope_global_variables");
    }

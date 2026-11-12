@@ -589,6 +589,8 @@ struct vtn_value {
    bool is_entrypoint:1;
 
    const char *name;
+   /* The name in OpEntryPoint (OpName may differ) */
+   const char *entry_point_name;
    struct vtn_decoration *decoration;
    struct vtn_type *type;
    union {
@@ -1025,6 +1027,8 @@ bool vtn_handle_glsl450_instruction(struct vtn_builder *b, SpvOp ext_opcode,
 
 bool vtn_handle_opencl_instruction(struct vtn_builder *b, SpvOp ext_opcode,
                                    const uint32_t *words, unsigned count);
+void vtn_handle_device_enqueue(struct vtn_builder *b, SpvOp opcode,
+                               const uint32_t *w, unsigned count);
 void vtn_handle_pipe(struct vtn_builder *b, SpvOp opcode,
                      const uint32_t *w, unsigned count);
 bool vtn_handle_opencl_core_instruction(struct vtn_builder *b, SpvOp opcode,
