@@ -484,13 +484,18 @@ pan_nir_lower_mediump_io(nir_shader *nir)
 
    switch (nir->info.stage) {
    case MESA_SHADER_VERTEX:
+      /* Vertex shaders feeding geometry or tessellation shaders store their
+       * outputs to memory in a 32-bit layout.
+       */
+      if (nir->info.next_stage != MESA_SHADER_FRAGMENT)
+         return;
       modes = nir_var_shader_out;
       break;
    case MESA_SHADER_FRAGMENT:
       modes = nir_var_shader_in;
       break;
    default:
-      assert(!"Unsupported shader");
+      /* Geometry and tessellation shaders are lowered to other programs */
       return;
    }
 
