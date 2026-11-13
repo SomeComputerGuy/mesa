@@ -274,6 +274,10 @@ impl Event {
         work: Option<EventSig>,
         cleanup: Option<CleanupSig>,
     ) -> CLResult<Arc<Event>> {
+        // CL_INVALID_COMMAND_QUEUE: host commands go to host command-queues only
+        if queue.dev_queue.is_some() {
+            return Err(CL_INVALID_COMMAND_QUEUE);
+        }
         let profiler: Box<dyn Profiler> = if queue.is_profiling_enabled() {
             if queue.device.screen().caps().query_buffer_object {
                 Box::new(GPUProfiler::new(queue.device)?)

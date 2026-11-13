@@ -919,6 +919,10 @@ impl DeviceBase {
 
     /// OpenCL 2.0 pipes (vtn_handle_pipe, rusticl_lower_pipes). clang only accepts
     /// __opencl_c_pipes together with __opencl_c_generic_address_space.
+    /// A reservation moves the pipe's index before the packets are written and commits do
+    /// nothing: correct only while a kernel that writes a pipe and one that reads it never run at
+    /// the same time on the GPU. That holds for kernels of one queue (in order); kernels of two
+    /// host queues using one pipe at the same time are not supported.
     pub fn pipes_supported(&self) -> bool {
         self.generic_address_space_supported()
     }

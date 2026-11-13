@@ -330,18 +330,18 @@ fn create_kernels_in_program(
 
     // CL_INVALID_PROGRAM_EXECUTABLE if there is no successfully built executable for any device in
     // program.
-    if build.kernels().is_empty() {
+    if build.api_kernels().is_empty() {
         return Err(CL_INVALID_PROGRAM_EXECUTABLE);
     }
 
     // CL_INVALID_VALUE if kernels is not NULL and num_kernels is less than the number of kernels
     // in program.
-    if !kernels.is_null() && build.kernels().len() > num_kernels as usize {
+    if !kernels.is_null() && build.api_kernels().len() > num_kernels as usize {
         return Err(CL_INVALID_VALUE);
     }
 
     let mut num_kernels = 0;
-    for name in build.kernels() {
+    for name in build.api_kernels() {
         // Kernel objects are not created for any __kernel functions in program that do not have the
         // same function definition across all devices for which a program executable has been
         // successfully built.
@@ -444,6 +444,12 @@ fn set_kernel_arg(
             let q: *const cl_command_queue = arg_value.cast();
             // SAFETY: arg_value points to a cl_command_queue (size checked above).
             let q = Queue::arc_from_raw(unsafe { *q }).or(Err(CL_INVALID_DEVICE_QUEUE))?;
+            // an on-device queue of the program's context and one of its devices
+            if !Arc::ptr_eq(&q.context, &k.prog.context)
+                || !k.prog.devs.iter().any(|&d| ptr::eq(d, q.device))
+            {
+                return Err(CL_INVALID_DEVICE_QUEUE);
+            }
             let dq = q.dev_queue.as_ref().ok_or(CL_INVALID_DEVICE_QUEUE)?;
             KernelArgValue::DevQueue(Arc::clone(&dq.res), dq.size)
         } else {
@@ -456,10 +462,18 @@ fn set_kernel_arg(
                 let ptr: *const cl_mem = arg_value.cast();
                 // SAFETY: for buffer args arg_value points to a cl_mem object or NULL.
                 if ptr.is_null() || unsafe { *ptr }.is_null() {
+                    // a pipe argument takes a pipe
+                    if arg.is_pipe() {
+                        return Err(CL_INVALID_MEM_OBJECT);
+                    }
                     KernelArgValue::None
                 } else {
                     // SAFETY: as above
                     let buffer = Buffer::arc_from_raw(unsafe { *ptr })?;
+                    // CL_INVALID_MEM_OBJECT: a pipe for a pipe argument, a buffer otherwise
+                    if buffer.pipe.is_some() != arg.is_pipe() {
+                        return Err(CL_INVALID_MEM_OBJECT);
+                    }
                     // We are required to prevent mutable access to immutable memory objects,
                     // however no explicit error code has been specified yet.
                     if arg.kind == KernelArgType::MemGlobal

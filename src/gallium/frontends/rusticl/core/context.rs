@@ -119,7 +119,12 @@ pub struct Context {
     pub gl_ctx_manager: Option<GLCtxManager>,
     /// per device: the default on-device queue, and the stand-in buffer kernels get without one
     default_dev_queues: Mutex<HashMap<&'static Device, Weak<Queue>>>,
+    /// per device: every on-device queue (CL_DEVICE_MAX_ON_DEVICE_QUEUES)
+    all_dev_queues: Mutex<HashMap<&'static Device, Vec<Weak<Queue>>>>,
     null_dev_queues: Mutex<HashMap<&'static Device, Arc<PipeResourceOwned>>>,
+    /// held by a host launch that uses on-device queues from their reset until the host ran
+    /// everything enqueued: the queue buffers are shared by all host queues of the context
+    pub dev_queue_lock: Mutex<()>,
 }
 
 impl_cl_type_trait!(cl_context, Context, CL_INVALID_CONTEXT);
@@ -141,12 +146,26 @@ impl Context {
             }),
             gl_ctx_manager: gl_ctx_manager,
             default_dev_queues: Mutex::new(HashMap::new()),
+            all_dev_queues: Mutex::new(HashMap::new()),
             null_dev_queues: Mutex::new(HashMap::new()),
+            dev_queue_lock: Mutex::new(()),
         })
     }
 
     pub fn default_device_queue(&self, dev: &'static Device) -> Option<Arc<Queue>> {
         self.default_dev_queues.lock().unwrap().get(dev)?.upgrade()
+    }
+
+    /// Counts q as an on-device queue of dev unless dev has max of them already
+    pub fn add_device_queue(&self, dev: &'static Device, q: &Arc<Queue>, max: usize) -> bool {
+        let mut all = self.all_dev_queues.lock().unwrap();
+        let qs = all.entry(dev).or_default();
+        qs.retain(|q| q.strong_count() > 0);
+        if qs.len() >= max {
+            return false;
+        }
+        qs.push(Arc::downgrade(q));
+        true
     }
 
     pub fn set_default_device_queue(&self, dev: &'static Device, q: &Arc<Queue>) {
@@ -157,24 +176,26 @@ impl Context {
     }
 
     /// The buffer kernels get as their default on-device queue: the default queue's, or an
-    /// invalid stand-in (no records fit, get_default_queue() returns CLK_NULL_QUEUE). Returns the
-    /// buffer and its record capacity, 0 for the stand-in.
+    /// invalid stand-in (no kernel records fit, get_default_queue() returns CLK_NULL_QUEUE). It
+    /// also holds the events of every on-device queue of a launch, so the stand-in has room for
+    /// profiling records. Returns the buffer, its record capacity and whether it is a valid
+    /// queue.
     pub fn device_queue_buffer(
         &self,
         dev: &'static Device,
-    ) -> CLResult<(Arc<PipeResourceOwned>, u32)> {
+    ) -> CLResult<(Arc<PipeResourceOwned>, u32, bool)> {
         if let Some(q) = self.default_device_queue(dev) {
             if let Some(dq) = &q.dev_queue {
-                return Ok((Arc::clone(&dq.res), dq.size));
+                return Ok((Arc::clone(&dq.res), dq.size, true));
             }
         }
         let mut nulls = self.null_dev_queues.lock().unwrap();
         if let Some(res) = nulls.get(dev) {
-            return Ok((Arc::clone(res), 0));
+            return Ok((Arc::clone(res), DEVQ_STANDIN_SIZE, false));
         }
-        let res = Arc::new(DeviceQueue::create_buffer(dev, 0)?);
+        let res = Arc::new(DeviceQueue::create_buffer(dev, DEVQ_STANDIN_SIZE)?);
         nulls.insert(dev, Arc::clone(&res));
-        Ok((res, 0))
+        Ok((res, DEVQ_STANDIN_SIZE, false))
     }
 
     pub fn create_buffer(

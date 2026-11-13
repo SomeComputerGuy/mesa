@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::ptr;
 use std::ptr::addr_of;
 use std::slice;
 use std::sync::Arc;
@@ -194,6 +195,16 @@ impl ProgramBuild {
 
     pub fn kernels(&self) -> &[CString] {
         &self.kernels
+    }
+
+    /// The kernels the application sees: all but the kernels clang makes of the blocks of
+    /// device-side enqueues (__<kernel>_block_invoke[_<n>]_kernel), which only the frontend
+    /// launches.
+    pub fn api_kernels(&self) -> Vec<&CString> {
+        self.kernels
+            .iter()
+            .filter(|k| !is_block_invoke_kernel(k.to_bytes()))
+            .collect()
     }
 
     pub fn has_successful_build(&self) -> bool {
@@ -733,10 +744,18 @@ impl Program {
             let at = r.offset as usize..r.offset as usize + size;
             let mut val = [0u8; 8];
             val[..size].copy_from_slice(&data[at.clone()]);
-            let addr = u64::from_le_bytes(val)
-                .wrapping_add(base)
-                .wrapping_add(r.target.into());
-            data[at].copy_from_slice(&addr.to_le_bytes()[..size]);
+            let addr = if size == 8 {
+                u64::from_ne_bytes(val)
+            } else {
+                u32::from_ne_bytes(val[..4].try_into().unwrap()).into()
+            }
+            .wrapping_add(base)
+            .wrapping_add(r.target.into());
+            if size == 8 {
+                data[at].copy_from_slice(&addr.to_ne_bytes());
+            } else {
+                data[at].copy_from_slice(&(addr as u32).to_ne_bytes());
+            }
         }
         dev.helper_ctx()
             .exec(|ctx| ctx.buffer_subdata(res, 0, data.as_ptr().cast(), data.len() as u32))
@@ -1150,6 +1169,12 @@ impl Program {
             device_build.status = CL_BUILD_IN_PROGRESS;
         }
 
+        // the program-scope variables of a new build start from their initial values
+        let mut globals = self.globals.lock().unwrap();
+        for &device in devices {
+            globals.retain(|&d, _| !ptr::eq(d, device));
+        }
+
         Ok(())
     }
 
@@ -1332,4 +1357,24 @@ fn create_link_closure(
 
         debug_logging(&program, &devices);
     }
+}
+
+/// clang's name of the kernel of a block: __<kernel>_block_invoke[_<n>]_kernel
+fn is_block_invoke_kernel(name: &[u8]) -> bool {
+    let Some(rest) = name
+        .strip_prefix(b"__")
+        .and_then(|n| n.strip_suffix(b"_kernel"))
+    else {
+        return false;
+    };
+    let digits = rest.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+    let rest = if digits > 0 {
+        match rest[..rest.len() - digits].strip_suffix(b"_") {
+            Some(r) => r,
+            None => return false,
+        }
+    } else {
+        rest
+    };
+    rest.ends_with(b"_block_invoke")
 }

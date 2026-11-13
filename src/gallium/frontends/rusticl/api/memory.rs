@@ -330,7 +330,9 @@ unsafe impl CLInfo<cl_mem_info> for cl_mem {
                 0
             }),
             CL_MEM_PROPERTIES => v.write::<&Properties<cl_mem_properties>>(&mem.props),
-            CL_MEM_REFERENCE_COUNT => v.write::<cl_uint>(if mem.is_buffer() {
+            CL_MEM_REFERENCE_COUNT => v.write::<cl_uint>(if mem.is_buffer()
+                || mem.mem_type == CL_MEM_OBJECT_PIPE
+            {
                 Buffer::refcnt(*self)?
             } else {
                 Image::refcnt(*self)?

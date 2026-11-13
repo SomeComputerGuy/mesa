@@ -187,6 +187,12 @@ impl KernelArg {
         self.spirv.type_name.as_bytes() == b"queue_t"
     }
 
+    /// pipe arguments take a pipe, other global memory arguments a buffer
+    pub fn is_pipe(&self) -> bool {
+        self.spirv.type_qualifier & clc_kernel_arg_type_qualifier::CLC_KERNEL_ARG_TYPE_PIPE
+            != clc_kernel_arg_type_qualifier(0)
+    }
+
     fn from_spirv_nir(spirv: &[spirv::SPIRVKernelArg], nir: &mut NirShader) -> Vec<Self> {
         let nir_arg_map: HashMap<_, _> = nir
             .variables_with_mode(
@@ -2004,7 +2010,8 @@ impl Kernel {
             } else {
                 None
             };
-            let mut dev_queues: Vec<(&PipeResourceOwned, u32, usize)> = Vec::new();
+            // (buffer, record capacity, valid queue, binding index, event buffer)
+            let mut dev_queues: Vec<(&PipeResourceOwned, u32, bool, usize, bool)> = Vec::new();
             let mut exec_builder =
                 KernelExecBuilder::new(ctx.dev, nir_kernel_build.input_size, buffer_arcs.len() + 2);
             // Set it once so we get the alignment padding right
@@ -2152,7 +2159,13 @@ impl Kernel {
                                 samplers.push(sampler.pipe());
                             }
                             KernelArgValue::DevQueue(res, size) => {
-                                dev_queues.push((res, *size, exec_builder.resources.len()));
+                                dev_queues.push((
+                                    res,
+                                    *size,
+                                    true,
+                                    exec_builder.resources.len(),
+                                    false,
+                                ));
                                 exec_builder.add_global(res, 0);
                             }
                             KernelArgValue::None => {
@@ -2168,8 +2181,8 @@ impl Kernel {
                         }
                     }
                     CompiledKernelArgType::DefaultQueue => {
-                        let (res, size) = default_queue.as_ref().unwrap();
-                        dev_queues.push((res, *size, exec_builder.resources.len()));
+                        let (res, size, valid) = default_queue.as_ref().unwrap();
+                        dev_queues.push((res, *size, *valid, exec_builder.resources.len(), true));
                         exec_builder.add_global(res, 0);
                     }
                     CompiledKernelArgType::ProgramGlobals(_) => {
@@ -2300,28 +2313,41 @@ impl Kernel {
                 .collect();
 
             // A kernel launched by the host starts with empty on-device queues; kernels the host
-            // launches for device-side enqueues keep appending to them.
+            // launches for device-side enqueues keep appending to them. The buffers are shared by
+            // every host queue of the context: one launch at a time uses them.
             let nested = DEVQ_NESTED.get();
-            if !nested {
-                let mut reset = HashSet::new();
-                for &(res, size, _) in &dev_queues {
-                    if reset.insert(ptr::from_ref(res)) {
-                        let header = DeviceQueue::initial_header(size, size != 0);
-                        ctx.buffer_subdata(res, 0, header.as_ptr().cast(), header.len() as u32);
-                    }
+            let _dev_queue_guard = if !nested && !dev_queues.is_empty() {
+                Some(cl_ctx.dev_queue_lock.lock().unwrap())
+            } else {
+                None
+            };
+            // one entry per buffer: the same queue can be bound twice (the default queue as a
+            // queue_t argument)
+            let mut dev_queue_addrs: Vec<DevQueueBinding> = Vec::new();
+            for &(res, cap, valid, idx, events) in &dev_queues {
+                let addr = read_addr(globals[idx]);
+                if let Some(q) = dev_queue_addrs.iter_mut().find(|q| ptr::eq(q.res, res)) {
+                    q.events |= events;
+                    continue;
                 }
+                if !nested {
+                    let header = DeviceQueue::initial_header(cap, valid);
+                    ctx.buffer_subdata(res, 0, header.as_ptr().cast(), header.len() as u32);
+                    let times = [0u8; DEVQ_RECORDS - DEVQ_TIMES];
+                    ctx.buffer_subdata(
+                        res,
+                        DEVQ_TIMES as u32,
+                        times.as_ptr().cast(),
+                        times.len() as u32,
+                    );
+                }
+                dev_queue_addrs.push(DevQueueBinding {
+                    res: res,
+                    addr: addr,
+                    capacity: cap,
+                    events: events,
+                });
             }
-            let dev_queue_addrs: Vec<(&PipeResourceOwned, u64)> = dev_queues
-                .iter()
-                .map(|&(res, _, idx)| {
-                    let addr = if ctx.dev.address_bits() == 64 {
-                        unsafe { globals[idx].cast::<u64>().read_unaligned() }
-                    } else {
-                        unsafe { globals[idx].read_unaligned() }.into()
-                    };
-                    (res, addr)
-                })
-                .collect();
 
             // The binding gave the address of the buffer of the program-scope variables: fill in
             // the addresses in their initial values before the first kernel runs.
@@ -2709,6 +2735,17 @@ thread_local! {
     static DEVQ_NESTED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// An on-device queue buffer bound to a launch
+struct DevQueueBinding<'a> {
+    res: &'a PipeResourceOwned,
+    /// its GPU address
+    addr: u64,
+    /// bytes for records, as the host created it (never the header's value)
+    capacity: u32,
+    /// the buffer of the default queue (or the stand-in): it holds the events of every queue
+    events: bool,
+}
+
 /// A record a kernel appended to an on-device queue (vtn_handle_device_enqueue)
 struct DevQueueRecord {
     /// queue index and byte offset of the record in the queue buffer
@@ -2747,22 +2784,96 @@ fn devq_u64(data: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(data[at..at + 8].try_into().unwrap())
 }
 
+/// The event id's slot in the event tables (ids 1 to DEVQ_MAX_EVENTS)
+fn devq_event_slot(e: u32) -> Option<usize> {
+    (e != 0 && e as usize <= DEVQ_MAX_EVENTS).then_some(e as usize % DEVQ_MAX_EVENTS)
+}
+
+/// The records in data (read from offset base of the record area of queue qi). Everything is
+/// checked against the record itself: the GPU writes the buffer.
+fn devq_parse(qi: usize, base: usize, data: &[u8], pending: &mut Vec<DevQueueRecord>) {
+    let mut at = 0;
+    while at + DEVQ_REC_WAIT <= data.len() {
+        let size = devq_u32(data, at + DEVQ_REC_SIZE) as usize;
+        // the size of the first record that did not fit marks the end
+        if size < DEVQ_REC_WAIT || size % 16 != 0 || size > data.len() - at {
+            break;
+        }
+        let r = &data[at..at + size];
+        at += size;
+
+        let num_events = devq_u32(r, DEVQ_REC_NUM_EVENTS) as usize;
+        let slots = devq_u32(r, DEVQ_REC_WAIT_SLOTS) as usize;
+        let num_locals = devq_u32(r, DEVQ_REC_NUM_LOCALS) as usize;
+        let kind = devq_u32(r, DEVQ_REC_KIND);
+        if slots > DEVQ_MAX_WAIT
+            || num_events > slots
+            || num_locals > DEVQ_MAX_WAIT
+            || DEVQ_REC_WAIT + 4 * (slots + num_locals) > size
+        {
+            continue;
+        }
+        let lists = DEVQ_REC_WAIT + 4 * (slots + num_locals);
+        let list = |first: usize, n: usize| {
+            (0..n)
+                .map(|i| devq_u32(r, DEVQ_REC_WAIT + 4 * (first + i)))
+                .collect::<Vec<_>>()
+        };
+        pending.push(DevQueueRecord {
+            queue: qi,
+            offset: DEVQ_RECORDS + base + at - size,
+            kind: kind,
+            invoke: devq_u32(r, DEVQ_REC_INVOKE),
+            work_dim: devq_u32(r, DEVQ_REC_DIM),
+            event: devq_u32(r, DEVQ_REC_EVENT),
+            waits: list(0, num_events),
+            locals: list(slots, num_locals),
+            global_offset: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_OFFSET + 8 * i)),
+            global: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_GLOBAL + 8 * i)),
+            local: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_LOCAL + 8 * i)),
+            aux: devq_u64(r, DEVQ_REC_AUX),
+            literal: lists.next_multiple_of(16),
+        });
+    }
+}
+
+/// Whether the host can launch a block with this NDRange (as clEnqueueNDRangeKernel checks)
+fn devq_ndrange_ok(dev: &Device, kernel: &Kernel, r: &DevQueueRecord, dim: usize) -> bool {
+    let device_max = u64::MAX >> (u64::BITS - dev.address_bits());
+    let mut threads = 1u64;
+    for i in 0..dim {
+        let (g, l, o) = (r.global[i], r.local[i], r.global_offset[i]);
+        if g == 0 || g.checked_add(o).is_none_or(|e| e > device_max) {
+            return false;
+        }
+        if l > dev.max_block_sizes()[i] as u64
+            || (l != 0 && g % l != 0 && !dev.non_uniform_wg_supported())
+        {
+            return false;
+        }
+        threads = threads.saturating_mul(l);
+    }
+    threads <= kernel.max_threads_per_block(dev) as u64
+}
+
 /// Runs the kernels a kernel enqueued on the device, and the ones these enqueue, once it is done:
 /// as the Arm blob does, the host launches them in the order they were enqueued, a record as soon
 /// as the events it waits for are complete. Every enqueue flag is satisfied by running a child
-/// after its parent completed. queues: the on-device queues the kernel had, with their address.
+/// after its parent completed. queues: the on-device queue buffers the kernel had, each once.
 fn run_device_enqueues(
     prog: &Arc<Program>,
     cl_ctx: &Context,
     ctx: &mut QueueContextWithState,
-    queues: &[(&PipeResourceOwned, u64)],
+    queues: &[DevQueueBinding],
     mem: &[(&PipeResource, u64, u64)],
 ) -> CLResult<()> {
     let ptr_size = (ctx.dev.address_bits() / 8) as usize;
     let mut cursors = vec![0usize; queues.len()];
     let mut pending: Vec<DevQueueRecord> = Vec::new();
-    // per event (queue, id) done: its execution and completion times in ns
-    let mut done: HashMap<(usize, u32), [u64; 2]> = HashMap::new();
+    // the buffer with the event tables (the default queue or the stand-in)
+    let evq = queues.iter().position(|q| q.events);
+    // per event id done: its execution and completion times in ns
+    let mut done: HashMap<u32, [u64; 2]> = HashMap::new();
     let mut kernels: HashMap<u32, Arc<Kernel>> = HashMap::new();
     let names: HashMap<u32, CString> = prog
         .build_info()
@@ -2772,52 +2883,19 @@ fn run_device_enqueues(
         .collect();
 
     loop {
-        // user event status, per queue
-        let mut status = Vec::with_capacity(queues.len());
-        for (qi, &(res, _)) in queues.iter().enumerate() {
-            let header = devq_read(ctx, res, 0, DEVQ_SPARE)?;
-            status.push(header[DEVQ_EVENTS..].to_vec());
-            let end = cmp::min(devq_u32(&header, DEVQ_USED), devq_u32(&header, DEVQ_CAPACITY))
-                as usize;
+        // user event status
+        let status = match evq {
+            Some(e) => devq_read(ctx, queues[e].res, DEVQ_EVENTS, 4 * DEVQ_MAX_EVENTS)?,
+            None => vec![0xff; 4 * DEVQ_MAX_EVENTS],
+        };
+        for (qi, q) in queues.iter().enumerate() {
+            let used = devq_u32(&devq_read(ctx, q.res, DEVQ_USED, 4)?, 0);
+            let end = cmp::min(used, q.capacity) as usize;
             if end <= cursors[qi] {
                 continue;
             }
-            let data = devq_read(ctx, res, DEVQ_RECORDS + cursors[qi], end - cursors[qi])?;
-            let mut at = 0;
-            while at + DEVQ_REC_WAIT <= data.len() {
-                let size = devq_u32(&data, at + DEVQ_REC_SIZE) as usize;
-                if size < DEVQ_REC_WAIT || at + size > data.len() {
-                    break;
-                }
-                let r = &data[at..at + size];
-                let num_events = devq_u32(r, DEVQ_REC_NUM_EVENTS) as usize;
-                let num_locals = devq_u32(r, DEVQ_REC_NUM_LOCALS) as usize;
-                let lists = DEVQ_REC_WAIT + 4 * (num_events + num_locals);
-                if lists > size {
-                    break;
-                }
-                let list = |first: usize, n: usize| {
-                    (0..n)
-                        .map(|i| devq_u32(r, DEVQ_REC_WAIT + 4 * (first + i)))
-                        .collect::<Vec<_>>()
-                };
-                pending.push(DevQueueRecord {
-                    queue: qi,
-                    offset: DEVQ_RECORDS + cursors[qi] + at,
-                    kind: devq_u32(r, DEVQ_REC_KIND),
-                    invoke: devq_u32(r, DEVQ_REC_INVOKE),
-                    work_dim: devq_u32(r, DEVQ_REC_DIM),
-                    event: devq_u32(r, DEVQ_REC_EVENT),
-                    waits: list(0, num_events),
-                    locals: list(num_events, num_locals),
-                    global_offset: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_OFFSET + 8 * i)),
-                    global: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_GLOBAL + 8 * i)),
-                    local: [0, 1, 2].map(|i| devq_u64(r, DEVQ_REC_LOCAL + 8 * i)),
-                    aux: devq_u64(r, DEVQ_REC_AUX),
-                    literal: lists.next_multiple_of(16),
-                });
-                at += size;
-            }
+            let data = devq_read(ctx, q.res, DEVQ_RECORDS + cursors[qi], end - cursors[qi])?;
+            devq_parse(qi, cursors[qi], &data, &mut pending);
             cursors[qi] = end;
         }
 
@@ -2826,9 +2904,9 @@ fn run_device_enqueues(
         while i < pending.len() {
             let r = &pending[i];
             let ready = r.waits.iter().all(|&e| {
-                let slot = (e as usize % DEVQ_MAX_EVENTS) * 4;
-                done.contains_key(&(r.queue, e)) || devq_u32(&status[r.queue], slot) != u32::MAX
-            }) && (r.kind != DEVQ_KIND_PROFILING || done.contains_key(&(r.queue, r.event)));
+                done.contains_key(&e)
+                    || devq_event_slot(e).is_some_and(|s| devq_u32(&status, 4 * s) != u32::MAX)
+            }) && (r.kind != DEVQ_KIND_PROFILING || done.contains_key(&r.event));
             if !ready {
                 i += 1;
                 continue;
@@ -2838,74 +2916,75 @@ fn run_device_enqueues(
 
             let mut times = [1u64, 1u64];
             if r.kind == DEVQ_KIND_PROFILING {
-                // CLK_PROFILING_COMMAND_EXEC_TIME: two u64 at the address the kernel gave
-                let t = done[&(r.queue, r.event)];
-                if let Some(&(res, base, _)) =
-                    mem.iter().find(|&&(_, base, size)| r.aux >= base && r.aux + 16 <= base + size)
-                {
-                    ctx.buffer_subdata_ref(res, (r.aux - base) as u32, t.as_ptr().cast(), 16);
+                // CLK_PROFILING_COMMAND_EXEC_TIME: two u64 at the address the kernel gave, if it
+                // is inside a buffer of the kernel
+                let t = done[&r.event];
+                if let Some(&(res, base, size)) = mem.iter().find(|&&(_, base, size)| {
+                    r.aux >= base
+                        && r.aux
+                            .checked_add(16)
+                            .is_some_and(|e| e <= base.saturating_add(size))
+                }) {
+                    if r.aux - base + 16 <= size {
+                        ctx.buffer_subdata_ref(res, (r.aux - base) as u32, t.as_ptr().cast(), 16);
+                    }
                 }
                 continue;
             }
             if r.kind == DEVQ_KIND_KERNEL {
                 let dim = r.work_dim.clamp(1, 3) as usize;
-                let Some(name) = names.get(&r.invoke) else {
-                    continue;
-                };
-                let kernel = match kernels.get(&r.invoke) {
-                    Some(k) => Arc::clone(k),
-                    None => {
-                        let k = Kernel::new(name.clone(), Arc::clone(prog), &prog.build_info());
-                        kernels.insert(r.invoke, Arc::clone(&k));
-                        k
+                let kernel = names.get(&r.invoke).map(|name| {
+                    Arc::clone(kernels.entry(r.invoke).or_insert_with(|| {
+                        Kernel::new(name.clone(), Arc::clone(prog), &prog.build_info())
+                    }))
+                });
+                // the kernel checked the NDRange as far as it can; what it cannot know
+                // (device limits) skips the block, its event completes
+                if let Some(kernel) = kernel.filter(|k| devq_ndrange_ok(ctx.dev, k, &r, dim)) {
+                    // the block literal in the record, and the sizes of local memory arguments
+                    let literal = queues[r.queue].addr + (r.offset + r.literal) as u64;
+                    let mut args: Vec<Option<KernelArgValue>> =
+                        (0..kernel.kernel_info.args.len()).map(|_| None).collect();
+                    if let Some(a) = args.first_mut() {
+                        *a = Some(KernelArgValue::Constant(
+                            literal.to_ne_bytes()[..ptr_size].to_vec(),
+                        ));
                     }
-                };
+                    for (a, &size) in args.iter_mut().skip(1).zip(&r.locals) {
+                        *a = Some(KernelArgValue::LocalMem(size as usize));
+                    }
 
-                // the block literal in the record, and the sizes of local memory arguments
-                let literal = queues[r.queue].1 + (r.offset + r.literal) as u64;
-                let mut args: Vec<Option<KernelArgValue>> =
-                    (0..kernel.kernel_info.args.len()).map(|_| None).collect();
-                if let Some(a) = args.first_mut() {
-                    *a = Some(KernelArgValue::Constant(
-                        literal.to_ne_bytes()[..ptr_size].to_vec(),
-                    ));
+                    let global = r.global.map(|v| v as usize);
+                    let offsets = r.global_offset.map(|v| v as usize);
+                    let local = r.local.map(|v| v as usize);
+                    let local: &[usize] = if local[..dim].contains(&0) {
+                        &[0; 3]
+                    } else {
+                        &local[..dim]
+                    };
+                    let launch = kernel.launch_with_args(
+                        ctx.dev,
+                        dim as u32,
+                        local,
+                        &global[..dim],
+                        &offsets[..dim],
+                        args,
+                    )?;
+                    let start = std::time::Instant::now();
+                    DEVQ_NESTED.set(true);
+                    let res = launch(cl_ctx, ctx);
+                    DEVQ_NESTED.set(false);
+                    res?;
+                    ctx.flush().wait();
+                    let ns = (start.elapsed().as_nanos() as u64).max(1);
+                    times = [ns, ns];
                 }
-                for (a, &size) in args.iter_mut().skip(1).zip(&r.locals) {
-                    *a = Some(KernelArgValue::LocalMem(size as usize));
-                }
-
-                let global = r.global.map(|v| v as usize);
-                let offsets = r.global_offset.map(|v| v as usize);
-                let local = r.local.map(|v| v as usize);
-                if global[..dim].contains(&0) {
-                    continue;
-                }
-                let local: &[usize] = if local[..dim].contains(&0) {
-                    &[0; 3]
-                } else {
-                    &local[..dim]
-                };
-                let launch = kernel.launch_with_args(
-                    ctx.dev,
-                    dim as u32,
-                    local,
-                    &global[..dim],
-                    &offsets[..dim],
-                    args,
-                )?;
-                let start = std::time::Instant::now();
-                DEVQ_NESTED.set(true);
-                let res = launch(cl_ctx, ctx);
-                DEVQ_NESTED.set(false);
-                res?;
-                ctx.flush().wait();
-                let ns = (start.elapsed().as_nanos() as u64).max(1);
-                times = [ns, ns];
             }
-            if r.event != 0 {
-                done.insert((r.queue, r.event), times);
-                let slot = DEVQ_TIMES + 16 * (r.event as usize % DEVQ_MAX_EVENTS);
-                ctx.buffer_subdata(queues[r.queue].0, slot as u32, times.as_ptr().cast(), 16);
+            // records of no kind (a failed enqueue) have no event
+            if let (Some(slot), Some(e)) = (devq_event_slot(r.event), evq) {
+                done.insert(r.event, times);
+                let at = DEVQ_TIMES + 16 * slot;
+                ctx.buffer_subdata(queues[e].res, at as u32, times.as_ptr().cast(), 16);
             }
         }
 

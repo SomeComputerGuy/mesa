@@ -73,9 +73,17 @@ unsafe impl CLInfo<cl_program_info> for cl_program {
                 // The spec _requires_ that we don't touch the buffer here.
                 _ => v.write_len_only::<&[u8]>(0),
             },
-            CL_PROGRAM_KERNEL_NAMES => v.write::<&CStr>(&prog.build_info().kernels().join(c";")),
+            CL_PROGRAM_KERNEL_NAMES => v.write::<&CStr>(
+                &prog
+                    .build_info()
+                    .api_kernels()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<CString>>()
+                    .join(c";"),
+            ),
             CL_PROGRAM_NUM_DEVICES => v.write::<cl_uint>(prog.devs.len() as cl_uint),
-            CL_PROGRAM_NUM_KERNELS => v.write::<usize>(prog.build_info().kernels().len()),
+            CL_PROGRAM_NUM_KERNELS => v.write::<usize>(prog.build_info().api_kernels().len()),
             CL_PROGRAM_REFERENCE_COUNT => v.write::<cl_uint>(Program::refcnt(*self)?),
             CL_PROGRAM_SCOPE_GLOBAL_CTORS_PRESENT => v.write::<cl_bool>(CL_FALSE),
             CL_PROGRAM_SCOPE_GLOBAL_DTORS_PRESENT => v.write::<cl_bool>(CL_FALSE),

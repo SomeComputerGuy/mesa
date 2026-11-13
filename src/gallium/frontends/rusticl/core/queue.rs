@@ -52,7 +52,7 @@ pub const DEVQ_VALID: usize = 12;
 pub const DEVQ_EVENTS: usize = 256;
 pub const DEVQ_MAX_EVENTS: usize = 1024;
 pub const DEVQ_SPARE: usize = DEVQ_EVENTS + 4 * DEVQ_MAX_EVENTS;
-pub const DEVQ_SPARE_SIZE: usize = 4096;
+pub const DEVQ_SPARE_SIZE: usize = 65536;
 /// per event the u64 execution and completion times in ns once its kernel is done
 pub const DEVQ_TIMES: usize = DEVQ_SPARE + DEVQ_SPARE_SIZE;
 pub const DEVQ_RECORDS: usize = DEVQ_TIMES + 16 * DEVQ_MAX_EVENTS;
@@ -68,8 +68,14 @@ pub const DEVQ_REC_OFFSET: usize = 32;
 pub const DEVQ_REC_GLOBAL: usize = 56;
 pub const DEVQ_REC_LOCAL: usize = 80;
 pub const DEVQ_REC_PARAM_SIZE: usize = 104;
+pub const DEVQ_REC_WAIT_SLOTS: usize = 108;
 pub const DEVQ_REC_AUX: usize = 112;
 pub const DEVQ_REC_WAIT: usize = 128;
+
+/// wait list entries of a record at most (vtn: VTN_DEVQ_MAX_WAIT)
+pub const DEVQ_MAX_WAIT: usize = DEVQ_MAX_EVENTS;
+/// record capacity of the stand-in buffer without a default queue: profiling records only
+pub const DEVQ_STANDIN_SIZE: u32 = 64 << 10;
 
 pub const DEVQ_KIND_KERNEL: u32 = 1;
 pub const DEVQ_KIND_MARKER: u32 = 2;
@@ -98,8 +104,10 @@ impl DeviceQueue {
     /// The header and event table of a queue with no records: written before a kernel that can
     /// enqueue runs. An invalid queue (the stand-in when there is no default queue) takes no
     /// records.
+    /// The spare record is left out: it starts at DEVQ_SPARE, the times table (all 0) at
+    /// DEVQ_TIMES.
     pub fn initial_header(size: u32, valid: bool) -> Vec<u8> {
-        let mut data = vec![0u8; DEVQ_RECORDS];
+        let mut data = vec![0u8; DEVQ_SPARE];
         data[DEVQ_CAPACITY..DEVQ_CAPACITY + 4].copy_from_slice(&size.to_ne_bytes());
         data[DEVQ_NEXT_EVENT..DEVQ_NEXT_EVENT + 4].copy_from_slice(&1u32.to_ne_bytes());
         data[DEVQ_VALID..DEVQ_VALID + 4].copy_from_slice(&u32::from(valid).to_ne_bytes());

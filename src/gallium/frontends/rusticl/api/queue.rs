@@ -154,6 +154,10 @@ pub fn create_command_queue_impl(
     let size = queue_size.unwrap_or(d.queue_on_device_preferred_size());
     let dq = DeviceQueue::new(d, size)?;
     let q = Queue::new(Arc::clone(&c), d, properties, properties_v2, Some(dq))?;
+    // CL_OUT_OF_RESOURCES beyond CL_DEVICE_MAX_ON_DEVICE_QUEUES
+    if !c.add_device_queue(d, &q, 1) {
+        return Err(CL_OUT_OF_RESOURCES);
+    }
     if bit_check(properties, CL_QUEUE_ON_DEVICE_DEFAULT) {
         c.set_default_device_queue(d, &q);
     }
@@ -256,13 +260,21 @@ fn enqueue_barrier_with_wait_list(
 #[cl_entrypoint(clFlush)]
 fn flush(command_queue: cl_command_queue) -> CLResult<()> {
     // CL_INVALID_COMMAND_QUEUE if command_queue is not a valid host command-queue.
-    Queue::ref_from_raw(command_queue)?.flush(false)
+    let q = Queue::ref_from_raw(command_queue)?;
+    if q.dev_queue.is_some() {
+        return Err(CL_INVALID_COMMAND_QUEUE);
+    }
+    q.flush(false)
 }
 
 #[cl_entrypoint(clFinish)]
 fn finish(command_queue: cl_command_queue) -> CLResult<()> {
     // CL_INVALID_COMMAND_QUEUE if command_queue is not a valid host command-queue.
-    Queue::ref_from_raw(command_queue)?.flush(true)
+    let q = Queue::ref_from_raw(command_queue)?;
+    if q.dev_queue.is_some() {
+        return Err(CL_INVALID_COMMAND_QUEUE);
+    }
+    q.flush(true)
 }
 
 #[cl_entrypoint(clRetainCommandQueue)]
@@ -274,6 +286,6 @@ fn retain_command_queue(command_queue: cl_command_queue) -> CLResult<()> {
 fn release_command_queue(command_queue: cl_command_queue) -> CLResult<()> {
     // clReleaseCommandQueue performs an implicit flush to issue any previously queued OpenCL
     // commands in command_queue.
-    flush(command_queue)?;
+    Queue::ref_from_raw(command_queue)?.flush(false)?;
     Queue::release(command_queue)
 }

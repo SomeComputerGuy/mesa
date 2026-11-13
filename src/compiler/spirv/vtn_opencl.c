@@ -1482,7 +1482,9 @@ vtn_handle_pipe(struct vtn_builder *b, SpvOp opcode,
  *
  *   header (256 bytes): uint32 used, capacity, next_event, valid
  *   uint32 event_status[1024]   user event status, ~0 while not set
- *   spare record (4096 bytes)   target of records that do not fit
+ *   spare record (64 KiB)       target of records that do not fit
+ *   uint64 times[1024][2]       per event the execution and completion
+ *                               times in ns, written by the host (0 before)
  *   records
  *
  * A kernel appends a record per enqueue_kernel / enqueue_marker /
@@ -1492,16 +1494,25 @@ vtn_handle_pipe(struct vtn_builder *b, SpvOp opcode,
  * as the Arm blob does. The block literal is copied into the record; the
  * block's kernel gets its address as its first argument.
  *
- * Record: uint32 size, kind (1 kernel, 2 marker, 3 profiling), invoke (hash
- * of the block kernel's entry point name), flags, work_dim, event,
- * num_events, num_locals; uint64 offset[3], global[3], local[3];
- * uint32 param_size, pad; uint64 aux (profiling destination), pad;
- * uint32 wait_events[num_events], local_sizes[num_locals]; then aligned to
- * 16 bytes the block literal.
+ * An enqueue that fails its checks reserves nothing. A reservation that
+ * does not fit writes its size at its offset when that is inside the
+ * capacity, so the host stops reading there and never reads records of an
+ * earlier launch.
  *
- * Header: uint32 used, capacity, next_event, valid; at EVENTS the status of
- * the user events; at TIMES per event the uint64 execution and completion
- * times in ns the host writes once its kernel is done (0 before).
+ * Events: the events of every on-device queue of a launch live in the
+ * buffer of the default queue (load_default_queue_cl: the default queue or
+ * the frontend's stand-in without one), so an event id means the same on
+ * every queue: ids 1 to 1024 from next_event, slot id % 1024 in the tables.
+ * Ids are not reused within a launch; past 1024, enqueues that return an
+ * event fail with CLK_EVENT_ALLOCATION_FAILURE and create_user_event
+ * returns CLK_NULL_EVENT.
+ *
+ * Record: uint32 size, kind (0 none, 1 kernel, 2 marker, 3 profiling),
+ * invoke (hash of the block kernel's entry point name), flags, work_dim,
+ * event, num_events, num_locals; uint64 offset[3], global[3], local[3];
+ * uint32 param_size, wait_slots; uint64 aux (profiling destination), pad;
+ * uint32 wait_events[wait_slots] (the first num_events used),
+ * local_sizes[num_locals]; then aligned to 16 bytes the block literal.
  */
 #define VTN_DEVQ_USED          0
 #define VTN_DEVQ_CAPACITY      4
@@ -1510,7 +1521,7 @@ vtn_handle_pipe(struct vtn_builder *b, SpvOp opcode,
 #define VTN_DEVQ_EVENTS        256
 #define VTN_DEVQ_MAX_EVENTS    1024
 #define VTN_DEVQ_SPARE         (VTN_DEVQ_EVENTS + 4 * VTN_DEVQ_MAX_EVENTS)
-#define VTN_DEVQ_SPARE_SIZE    4096
+#define VTN_DEVQ_SPARE_SIZE    65536
 #define VTN_DEVQ_TIMES         (VTN_DEVQ_SPARE + VTN_DEVQ_SPARE_SIZE)
 #define VTN_DEVQ_RECORDS       (VTN_DEVQ_TIMES + 16 * VTN_DEVQ_MAX_EVENTS)
 
@@ -1526,11 +1537,22 @@ vtn_handle_pipe(struct vtn_builder *b, SpvOp opcode,
 #define VTN_DEVQ_REC_GLOBAL     56
 #define VTN_DEVQ_REC_LOCAL      80
 #define VTN_DEVQ_REC_PARAM_SIZE 104
+#define VTN_DEVQ_REC_WAIT_SLOTS 108
 #define VTN_DEVQ_REC_AUX        112
 #define VTN_DEVQ_REC_WAIT       128
 
-#define VTN_CLK_ENQUEUE_FAILURE -101
-#define VTN_CLK_INVALID_QUEUE   -102
+/* wait list entries of a record: at most one per event; when the count is
+ * only known at run time, this many (a longer list is
+ * CLK_INVALID_EVENT_WAIT_LIST)
+ */
+#define VTN_DEVQ_MAX_WAIT       VTN_DEVQ_MAX_EVENTS
+#define VTN_DEVQ_MAX_WAIT_RT    64
+
+#define VTN_CLK_INVALID_EVENT_WAIT_LIST  -57
+#define VTN_CLK_EVENT_ALLOCATION_FAILURE -100
+#define VTN_CLK_ENQUEUE_FAILURE          -101
+#define VTN_CLK_INVALID_QUEUE            -102
+#define VTN_CLK_INVALID_NDRANGE          -160
 
 static nir_deref_instr *
 vtn_devq_deref(nir_builder *b, nir_def *addr, const struct glsl_type *type,
@@ -1576,6 +1598,46 @@ vtn_devq_default(nir_builder *b)
    return nir_bcsel(b, nir_ine_imm(b, valid, 0), q, nir_imm_int64(b, 0));
 }
 
+/* the spare record of the event buffer: target of stores that must not land */
+static nir_def *
+vtn_devq_spare(nir_builder *b)
+{
+   return nir_iadd_imm(b, nir_load_default_queue_cl(b), VTN_DEVQ_SPARE);
+}
+
+static nir_def *
+vtn_devq_event_valid(nir_builder *b, nir_def *e)
+{
+   e = nir_u2u64(b, e);
+   return nir_iand(b, nir_ine_imm(b, e, 0),
+                   nir_ule_imm(b, e, VTN_DEVQ_MAX_EVENTS));
+}
+
+/* the address of event e in the table at offset base of the event buffer
+ * (stride bytes per event), the spare record for an invalid event
+ */
+static nir_def *
+vtn_devq_event_slot(nir_builder *b, nir_def *e, unsigned base, unsigned stride)
+{
+   nir_def *evq = nir_load_default_queue_cl(b);
+   nir_def *idx = nir_u2u64(b, nir_iand_imm(b, nir_u2u32(b, e),
+                                            VTN_DEVQ_MAX_EVENTS - 1));
+   nir_def *addr = nir_iadd(b, nir_iadd_imm(b, evq, base),
+                            nir_imul_imm(b, idx, stride));
+   return nir_bcsel(b, vtn_devq_event_valid(b, e), addr, vtn_devq_spare(b));
+}
+
+/* a new event id when want, 0 when not wanted or none is left */
+static nir_def *
+vtn_devq_alloc_event(nir_builder *b, nir_def *want)
+{
+   nir_def *id = vtn_devq_atomic_add(b, nir_load_default_queue_cl(b),
+                                     VTN_DEVQ_NEXT_EVENT,
+                                     nir_b2i32(b, want));
+   return nir_bcsel(b, nir_iand(b, want, nir_ule_imm(b, id, VTN_DEVQ_MAX_EVENTS)),
+                    id, nir_imm_int(b, 0));
+}
+
 /* FNV-1a of the entry point name of a block kernel, the host maps it back */
 static uint32_t
 vtn_devq_invoke_hash(struct vtn_builder *b, uint32_t func_id)
@@ -1596,88 +1658,223 @@ vtn_devq_is_null_ptr(struct vtn_builder *b, uint32_t id)
    return v->value_type == vtn_value_type_constant && v->is_null_constant;
 }
 
-/* Reserves a record of size bytes on queue q (0 = invalid). Returns the
- * record address and sets *res to the enqueue result.
+/* whether the pointer is a plain address, which can be NULL at run time
+ * (not a variable, also not one cast to generic: that is a mov of its deref)
+ */
+static bool
+vtn_devq_is_address(nir_deref_instr *d)
+{
+   if (d->deref_type != nir_deref_type_cast)
+      return false;
+   nir_def *p = d->parent.ssa;
+   while (nir_def_is_alu(p) && nir_def_as_alu(p)->op == nir_op_mov)
+      p = nir_def_as_alu(p)->src[0].src.ssa;
+   return !nir_def_is_deref(p);
+}
+
+/* d cast to type, or the spare record where use_spare is true */
+static nir_deref_instr *
+vtn_devq_ptr_or_spare(nir_builder *b, nir_deref_instr *d, nir_def *use_spare,
+                      const struct glsl_type *type, unsigned align)
+{
+   if (use_spare && vtn_devq_is_address(d)) {
+      nir_def *addr = d->parent.ssa;
+      addr = nir_bcsel(b, use_spare,
+                       nir_u2uN(b, vtn_devq_spare(b), addr->bit_size), addr);
+      return nir_build_deref_cast_with_alignment(b, addr, d->modes, type, align,
+                                                 align, 0);
+   }
+   return nir_build_deref_cast_with_alignment(b, &d->def, d->modes, type, align,
+                                              align, 0);
+}
+
+/* Reserves size bytes for a record on queue q (0 is CLK_NULL_QUEUE) if
+ * pre_ok, nothing otherwise. Returns the record address, the spare record
+ * when *ok is false; *bad is set for an invalid queue. check_valid: q must
+ * be a valid on-device queue (all but profiling records).
  */
 static nir_def *
-vtn_devq_reserve(nir_builder *b, nir_def *q, unsigned size, nir_def **res)
+vtn_devq_reserve(nir_builder *b, nir_def *q, unsigned size, nir_def *pre_ok,
+                 bool check_valid, nir_def **ok, nir_def **bad)
 {
    nir_def *is_null = nir_ieq_imm(b, q, 0);
    nir_def *qe = nir_bcsel(b, is_null, nir_load_default_queue_cl(b), q);
-   nir_def *bad = nir_ior(b, is_null,
-                          nir_ieq_imm(b, vtn_devq_load_u32(b, qe, VTN_DEVQ_VALID), 0));
-   nir_def *off = vtn_devq_atomic_add(b, qe, VTN_DEVQ_USED, nir_imm_int(b, size));
-   nir_def *cap = vtn_devq_load_u32(b, qe, VTN_DEVQ_CAPACITY);
-   nir_def *fits = nir_uge(b, nir_u2u64(b, cap),
-                           nir_iadd_imm(b, nir_u2u64(b, off), size));
-   nir_def *ok = nir_iand(b, nir_inot(b, bad), fits);
-   *res = nir_bcsel(b, ok, nir_imm_int(b, 0),
-                    nir_bcsel(b, bad, nir_imm_int(b, VTN_CLK_INVALID_QUEUE),
-                              nir_imm_int(b, VTN_CLK_ENQUEUE_FAILURE)));
-   nir_def *rec_off = nir_bcsel(b, ok,
-                                nir_iadd_imm(b, nir_u2u64(b, off), VTN_DEVQ_RECORDS),
-                                nir_imm_int64(b, VTN_DEVQ_SPARE));
-   return nir_iadd(b, qe, rec_off);
+   *bad = is_null;
+   if (check_valid) {
+      *bad = nir_ior(b, *bad,
+                     nir_ieq_imm(b, vtn_devq_load_u32(b, qe, VTN_DEVQ_VALID), 0));
+   }
+   nir_def *want = nir_iand(b, nir_inot(b, *bad), pre_ok);
+   nir_def *off = vtn_devq_atomic_add(b, qe, VTN_DEVQ_USED,
+                                      nir_bcsel(b, want, nir_imm_int(b, size),
+                                                nir_imm_int(b, 0)));
+   nir_def *off64 = nir_u2u64(b, off);
+   nir_def *cap = nir_u2u64(b, vtn_devq_load_u32(b, qe, VTN_DEVQ_CAPACITY));
+   nir_def *fits = nir_uge(b, cap, nir_iadd_imm(b, off64, size));
+   *ok = nir_iand(b, want, fits);
+
+   /* the size word; also of the first record that does not fit, where the
+    * host stops reading
+    */
+   nir_def *mark = nir_iand(b, nir_iand(b, want, nir_inot(b, fits)),
+                            nir_uge(b, cap, nir_iadd_imm(b, off64, 4)));
+   nir_def *rec = nir_iadd(b, qe, nir_iadd_imm(b, off64, VTN_DEVQ_RECORDS));
+   nir_def *spare = nir_iadd_imm(b, qe, VTN_DEVQ_SPARE);
+   vtn_devq_store(b, nir_bcsel(b, nir_ior(b, *ok, mark), rec, spare), VTN_DEVQ_REC_SIZE,
+                  nir_imm_int(b, size));
+
+   return nir_bcsel(b, *ok, rec, spare);
 }
 
-/* Event ids of the wait list into the record, an event id for ret_event */
+/* the wait list of an enqueue */
+struct vtn_devq_waits {
+   /* entries in the record */
+   unsigned slots;
+   /* number of events (32 bit), whether the list is valid, the ids */
+   nir_def *num;
+   nir_def *ok;
+   nir_def *ids[VTN_DEVQ_MAX_WAIT];
+};
+
 static void
-vtn_devq_events(struct vtn_builder *b, nir_def *q, nir_def *rec,
-                nir_def *ok, uint32_t num_id, uint32_t wait_id, uint32_t ret_id,
-                unsigned *num_events)
+vtn_devq_load_waits(struct vtn_builder *b, uint32_t num_id, uint32_t wait_id,
+                    struct vtn_devq_waits *w)
 {
    nir_builder *nb = &b->nb;
-   *num_events = vtn_constant_uint(b, num_id);
-   vtn_fail_if(*num_events > 64, "Too many events in an enqueue");
-   vtn_devq_store(nb, rec, VTN_DEVQ_REC_NUM_EVENTS, nir_imm_int(nb, *num_events));
+   bool is_const = vtn_untyped_value(b, num_id)->value_type ==
+                   vtn_value_type_constant;
+   nir_def *n = nir_u2u32(nb, vtn_get_nir_ssa(b, num_id));
 
-   if (*num_events) {
-      struct vtn_pointer *ptr = vtn_value(b, wait_id, vtn_value_type_pointer)->pointer;
-      nir_deref_instr *d = vtn_pointer_to_deref(b, ptr);
-      nir_deref_instr *arr =
-         nir_build_deref_cast_with_alignment(nb, &d->def, d->modes,
-                                             glsl_uint64_t_type(), 8, 8, 0);
-      for (unsigned i = 0; i < *num_events; i++) {
-         nir_def *e = nir_load_deref(nb, nir_build_deref_ptr_as_array(nb, arr, nir_imm_int64(nb, i)));
-         vtn_devq_store(nb, rec, VTN_DEVQ_REC_WAIT + 4 * i, nir_u2u32(nb, e));
+   if (is_const) {
+      w->slots = vtn_constant_uint(b, num_id);
+      /* more events than can exist */
+      if (w->slots > VTN_DEVQ_MAX_WAIT) {
+         w->slots = 0;
+         w->num = n;
+         w->ok = nir_imm_false(nb);
+         return;
       }
+   } else {
+      w->slots = VTN_DEVQ_MAX_WAIT_RT;
+   }
+   w->num = n;
+   w->ok = nir_ule_imm(nb, n, w->slots);
+
+   if (w->slots == 0 || vtn_devq_is_null_ptr(b, wait_id)) {
+      w->slots = 0;
+      w->ok = nir_ieq_imm(nb, n, 0);
+      return;
    }
 
-   nir_def *event = nir_imm_int(nb, 0);
-   if (!vtn_devq_is_null_ptr(b, ret_id)) {
-      nir_def *qe = nir_bcsel(nb, nir_ieq_imm(nb, q, 0), nir_load_default_queue_cl(nb), q);
-      nir_def *id = vtn_devq_atomic_add(nb, qe, VTN_DEVQ_NEXT_EVENT, nir_imm_int(nb, 1));
-      event = nir_bcsel(nb, ok, id, nir_imm_int(nb, 0));
-      struct vtn_pointer *ptr = vtn_value(b, ret_id, vtn_value_type_pointer)->pointer;
-      nir_deref_instr *d = vtn_pointer_to_deref(b, ptr);
-      nir_deref_instr *e =
-         nir_build_deref_cast_with_alignment(nb, &d->def, d->modes,
-                                             glsl_uint64_t_type(), 8, 8, 0);
-      nir_store_deref(nb, e, nir_u2u64(nb, event), 1);
+   struct vtn_pointer *ptr = vtn_value(b, wait_id, vtn_value_type_pointer)->pointer;
+   nir_deref_instr *d = vtn_pointer_to_deref(b, ptr);
+   /* with a run-time count, read entry min(i, n - 1), the spare record for
+    * n = 0 (the list may be NULL then)
+    */
+   nir_def *empty = is_const ? NULL : nir_ieq_imm(nb, n, 0);
+   nir_deref_instr *arr = vtn_devq_ptr_or_spare(nb, d, empty,
+                                                glsl_uint64_t_type(), 8);
+   nir_def *last = nir_iadd_imm(nb, nir_umax_imm(nb, n, 1), -1);
+   for (unsigned i = 0; i < w->slots; i++) {
+      nir_def *idx = is_const ? nir_imm_int64(nb, i)
+                              : nir_u2u64(nb, nir_umin_imm(nb, last, i));
+      nir_def *e = nir_load_deref(nb, nir_build_deref_ptr_as_array(nb, arr, idx));
+      w->ids[i] = nir_u2u32(nb, e);
+      nir_def *valid = vtn_devq_event_valid(nb, e);
+      if (!is_const)
+         valid = nir_ior(nb, valid, nir_ule_imm(nb, n, i));
+      w->ok = nir_iand(nb, w->ok, valid);
    }
-   vtn_devq_store(nb, rec, VTN_DEVQ_REC_EVENT, event);
 }
 
 static void
-vtn_devq_copy_ndrange(struct vtn_builder *b, nir_def *rec, uint32_t ptr_id)
+vtn_devq_store_waits(nir_builder *b, nir_def *rec, struct vtn_devq_waits *w)
+{
+   vtn_devq_store(b, rec, VTN_DEVQ_REC_NUM_EVENTS, w->num);
+   vtn_devq_store(b, rec, VTN_DEVQ_REC_WAIT_SLOTS, nir_imm_int(b, w->slots));
+   for (unsigned i = 0; i < w->slots; i++)
+      vtn_devq_store(b, rec, VTN_DEVQ_REC_WAIT + 4 * i, w->ids[i]);
+}
+
+/* the ret event of an enqueue: whether one is asked for (run time) */
+static nir_def *
+vtn_devq_wants_event(struct vtn_builder *b, uint32_t ret_id)
+{
+   nir_builder *nb = &b->nb;
+   if (vtn_devq_is_null_ptr(b, ret_id))
+      return nir_imm_false(nb);
+   struct vtn_pointer *ptr = vtn_value(b, ret_id, vtn_value_type_pointer)->pointer;
+   nir_deref_instr *d = vtn_pointer_to_deref(b, ptr);
+   if (!vtn_devq_is_address(d))
+      return nir_imm_true(nb);
+   return nir_ine_imm(nb, d->parent.ssa, 0);
+}
+
+static void
+vtn_devq_store_ret_event(struct vtn_builder *b, uint32_t ret_id, nir_def *event)
+{
+   nir_builder *nb = &b->nb;
+   if (vtn_devq_is_null_ptr(b, ret_id))
+      return;
+   struct vtn_pointer *ptr = vtn_value(b, ret_id, vtn_value_type_pointer)->pointer;
+   nir_deref_instr *d = vtn_pointer_to_deref(b, ptr);
+   nir_def *is_null = vtn_devq_is_address(d) ? nir_ieq_imm(nb, d->parent.ssa, 0) : NULL;
+   nir_deref_instr *e = vtn_devq_ptr_or_spare(nb, d, is_null,
+                                              glsl_uint64_t_type(), 8);
+   nir_store_deref(nb, e, nir_u2u64(nb, event), 1);
+}
+
+/* the ndrange_t: work_dim (32 bit), offset[3], global[3], local[3] (64 bit);
+ * returns whether it is valid
+ */
+static nir_def *
+vtn_devq_load_ndrange(struct vtn_builder *b, uint32_t ptr_id, nir_def *nd[10])
 {
    nir_builder *nb = &b->nb;
    struct vtn_pointer *ptr = vtn_value(b, ptr_id, vtn_value_type_pointer)->pointer;
-   nir_deref_instr *nd = vtn_pointer_to_deref(b, ptr);
-   vtn_fail_if(!glsl_type_is_struct(nd->type) || glsl_get_length(nd->type) != 4,
+   nir_deref_instr *d = vtn_pointer_to_deref(b, ptr);
+   vtn_fail_if(!glsl_type_is_struct(d->type) || glsl_get_length(d->type) != 4,
                "NDRange must point to an ndrange_t");
 
-   nir_def *dim = nir_load_deref(nb, nir_build_deref_struct(nb, nd, 0));
-   vtn_devq_store(nb, rec, VTN_DEVQ_REC_DIM, nir_u2u32(nb, dim));
+   nir_def *dim = nir_u2u32(nb, nir_load_deref(nb, nir_build_deref_struct(nb, d, 0)));
+   nd[0] = dim;
+   for (unsigned m = 0; m < 3; m++) {
+      nir_deref_instr *arr = nir_build_deref_struct(nb, d, m + 1);
+      for (unsigned i = 0; i < 3; i++) {
+         nir_def *v = nir_load_deref(nb, nir_build_deref_array_imm(nb, arr, i));
+         nd[1 + 3 * m + i] = nir_u2u64(nb, v);
+      }
+   }
+
+   /* work_dim 1 to 3, no zero global size in it, no work-group larger than
+    * the device's
+    */
+   nir_def *ok = nir_iand(nb, nir_uge_imm(nb, dim, 1), nir_ule_imm(nb, dim, 3));
+   unsigned max_wg = b->options->cl_max_workgroup_invocations;
+   nir_def *threads = nir_imm_int64(nb, 1);
+   for (unsigned i = 0; i < 3; i++) {
+      nir_def *unused = nir_ule_imm(nb, dim, i);
+      ok = nir_iand(nb, ok, nir_ior(nb, nir_ine_imm(nb, nd[4 + i], 0), unused));
+      if (max_wg) {
+         nir_def *l = nir_bcsel(nb, unused, nir_imm_int64(nb, 1), nd[7 + i]);
+         threads = nir_imul(nb, threads, nir_umin_imm(nb, l, max_wg + 1));
+      }
+   }
+   if (max_wg)
+      ok = nir_iand(nb, ok, nir_ule_imm(nb, threads, max_wg));
+   return ok;
+}
+
+static void
+vtn_devq_store_ndrange(nir_builder *b, nir_def *rec, nir_def *nd[10])
+{
    static const unsigned offsets[3] = {
       VTN_DEVQ_REC_OFFSET, VTN_DEVQ_REC_GLOBAL, VTN_DEVQ_REC_LOCAL,
    };
+   vtn_devq_store(b, rec, VTN_DEVQ_REC_DIM, nd[0]);
    for (unsigned m = 0; m < 3; m++) {
-      nir_deref_instr *arr = nir_build_deref_struct(nb, nd, m + 1);
-      for (unsigned i = 0; i < 3; i++) {
-         nir_def *v = nir_load_deref(nb, nir_build_deref_array_imm(nb, arr, i));
-         vtn_devq_store(nb, rec, offsets[m] + 8 * i, nir_u2u64(nb, v));
-      }
+      for (unsigned i = 0; i < 3; i++)
+         vtn_devq_store(b, rec, offsets[m] + 8 * i, nd[1 + 3 * m + i]);
    }
 }
 
@@ -1703,6 +1900,19 @@ vtn_devq_copy_param(struct vtn_builder *b, nir_def *dst, uint32_t ptr_id,
       nir_def *v = nir_load_deref(nb, nir_build_deref_ptr_as_array(nb, src_cast, nir_imm_int64(nb, i)));
       nir_store_deref(nb, nir_build_deref_ptr_as_array(nb, dst_cast, nir_imm_int64(nb, i)), v, 1);
    }
+}
+
+/* the enqueue result */
+static nir_def *
+vtn_devq_result(nir_builder *b, nir_def *ok, nir_def *bad, nir_def *waits_ok,
+                nir_def *nd_ok, nir_def *ev_fail)
+{
+   nir_def *res = nir_imm_int(b, VTN_CLK_ENQUEUE_FAILURE);
+   res = nir_bcsel(b, ev_fail, nir_imm_int(b, VTN_CLK_EVENT_ALLOCATION_FAILURE), res);
+   res = nir_bcsel(b, nd_ok, res, nir_imm_int(b, VTN_CLK_INVALID_NDRANGE));
+   res = nir_bcsel(b, waits_ok, res, nir_imm_int(b, VTN_CLK_INVALID_EVENT_WAIT_LIST));
+   res = nir_bcsel(b, bad, nir_imm_int(b, VTN_CLK_INVALID_QUEUE), res);
+   return nir_bcsel(b, ok, nir_imm_int(b, 0), res);
 }
 
 void
@@ -1755,27 +1965,36 @@ vtn_handle_device_enqueue(struct vtn_builder *b, SpvOp opcode,
       /* Queue, Flags, ND Range, Num Events, Wait Events, Ret Event, Invoke,
        * Param, Param Size, Param Align, Local Size...
        */
-      unsigned num_events = vtn_constant_uint(b, w[6]);
+      struct vtn_devq_waits waits;
+      vtn_devq_load_waits(b, w[6], w[7], &waits);
       unsigned num_locals = count - 13;
       unsigned param_size = vtn_constant_uint(b, w[11]);
       unsigned param_align = vtn_constant_uint(b, w[12]);
-      unsigned lit_off = align(VTN_DEVQ_REC_WAIT + 4 * (num_events + num_locals), 16);
+      unsigned lit_off = align(VTN_DEVQ_REC_WAIT + 4 * (waits.slots + num_locals), 16);
       unsigned size = align(lit_off + param_size, 16);
       vtn_fail_if(size > VTN_DEVQ_SPARE_SIZE, "Block literal too large to enqueue");
 
+      nir_def *nd[10];
+      nir_def *nd_ok = vtn_devq_load_ndrange(b, w[5], nd);
+
       nir_def *q = vtn_get_nir_ssa(b, w[3]);
-      nir_def *res;
-      nir_def *rec = vtn_devq_reserve(nb, q, size, &res);
-      nir_def *ok = nir_ieq_imm(nb, res, 0);
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_SIZE, nir_imm_int(nb, size));
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_KIND, nir_imm_int(nb, 1));
+      nir_def *ok, *bad;
+      nir_def *rec = vtn_devq_reserve(nb, q, size, nir_iand(nb, waits.ok, nd_ok),
+                                      true, &ok, &bad);
+      nir_def *want_ev = nir_iand(nb, ok, vtn_devq_wants_event(b, w[8]));
+      nir_def *event = vtn_devq_alloc_event(nb, want_ev);
+      nir_def *ev_fail = nir_iand(nb, want_ev, nir_ieq_imm(nb, event, 0));
+      nir_def *done = nir_iand(nb, ok, nir_inot(nb, ev_fail));
+
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_KIND, nir_b2i32(nb, done));
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_INVOKE,
                      nir_imm_int(nb, vtn_devq_invoke_hash(b, w[9])));
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_FLAGS, nir_u2u32(nb, vtn_get_nir_ssa(b, w[4])));
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_EVENT, event);
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_NUM_LOCALS, nir_imm_int(nb, num_locals));
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_PARAM_SIZE, nir_imm_int(nb, param_size));
-      vtn_devq_copy_ndrange(b, rec, w[5]);
-      vtn_devq_events(b, q, rec, ok, w[6], w[7], w[8], &num_events);
+      vtn_devq_store_ndrange(nb, rec, nd);
+      vtn_devq_store_waits(nb, rec, &waits);
       for (unsigned i = 0; i < num_locals; i++) {
          /* The SPIR-V LLVM translator passes a pointer to each local size
           * (an element of the array clang builds for the sizes).
@@ -1788,89 +2007,98 @@ vtn_handle_device_enqueue(struct vtn_builder *b, SpvOp opcode,
          } else {
             local = vtn_get_nir_ssa(b, w[13 + i]);
          }
-         vtn_devq_store(nb, rec, VTN_DEVQ_REC_WAIT + 4 * (num_events + i),
+         vtn_devq_store(nb, rec, VTN_DEVQ_REC_WAIT + 4 * (waits.slots + i),
                         nir_u2u32(nb, local));
       }
       vtn_devq_copy_param(b, nir_iadd_imm(nb, rec, lit_off), w[10], param_size,
                           param_align);
-      vtn_push_nir_ssa(b, w[2], res);
+      vtn_devq_store_ret_event(b, w[8], event);
+      vtn_push_nir_ssa(b, w[2], vtn_devq_result(nb, done, bad, waits.ok, nd_ok, ev_fail));
       return;
    }
 
    case SpvOpEnqueueMarker: {
       /* Queue, Num Events, Wait Events, Ret Event */
-      unsigned num_events = vtn_constant_uint(b, w[4]);
-      unsigned size = align(VTN_DEVQ_REC_WAIT + 4 * num_events, 16);
+      struct vtn_devq_waits waits;
+      vtn_devq_load_waits(b, w[4], w[5], &waits);
+      unsigned size = align(VTN_DEVQ_REC_WAIT + 4 * waits.slots, 16);
       nir_def *q = vtn_get_nir_ssa(b, w[3]);
-      nir_def *res;
-      nir_def *rec = vtn_devq_reserve(nb, q, size, &res);
-      nir_def *ok = nir_ieq_imm(nb, res, 0);
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_SIZE, nir_imm_int(nb, size));
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_KIND, nir_imm_int(nb, 2));
+      nir_def *ok, *bad;
+      nir_def *rec = vtn_devq_reserve(nb, q, size, waits.ok, true, &ok, &bad);
+      nir_def *want_ev = nir_iand(nb, ok, vtn_devq_wants_event(b, w[6]));
+      nir_def *event = vtn_devq_alloc_event(nb, want_ev);
+      nir_def *ev_fail = nir_iand(nb, want_ev, nir_ieq_imm(nb, event, 0));
+      nir_def *done = nir_iand(nb, ok, nir_inot(nb, ev_fail));
+
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_KIND,
+                     nir_bcsel(nb, done, nir_imm_int(nb, 2), nir_imm_int(nb, 0)));
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_EVENT, event);
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_NUM_LOCALS, nir_imm_int(nb, 0));
-      vtn_devq_events(b, q, rec, ok, w[4], w[5], w[6], &num_events);
-      vtn_push_nir_ssa(b, w[2], res);
+      vtn_devq_store_waits(nb, rec, &waits);
+      vtn_devq_store_ret_event(b, w[6], event);
+      vtn_push_nir_ssa(b, w[2], vtn_devq_result(nb, done, bad, waits.ok,
+                                                nir_imm_true(nb), ev_fail));
       return;
    }
 
    case SpvOpCaptureEventProfilingInfo: {
       /* Event, Profiling Info, Value: the times of a command that is done
-       * are written right away; the record makes the host write them once
-       * the command is done.
+       * are written right away; otherwise a record makes the host write
+       * them once the command is done.
        */
-      nir_def *evt = nir_u2u32(nb, vtn_get_nir_ssa(b, w[1]));
-      nir_def *slot = nir_imul_imm(nb, nir_iand_imm(nb, evt, VTN_DEVQ_MAX_EVENTS - 1), 16);
-      nir_def *times = nir_iadd(nb, nir_load_default_queue_cl(nb), nir_u2u64(nb, slot));
+      nir_def *evt = vtn_get_nir_ssa(b, w[1]);
+      nir_def *ev_ok = vtn_devq_event_valid(nb, evt);
+      nir_def *times = vtn_devq_event_slot(nb, evt, VTN_DEVQ_TIMES, 16);
       nir_def *t[2];
       for (unsigned i = 0; i < 2; i++) {
          nir_deref_instr *d = vtn_devq_deref(
-            nb, nir_iadd_imm(nb, times, VTN_DEVQ_TIMES + 8 * i), glsl_uint64_t_type(), 8);
+            nb, nir_iadd_imm(nb, times, 8 * i), glsl_uint64_t_type(), 8);
          t[i] = nir_load_deref_with_access(nb, d, ACCESS_COHERENT | ACCESS_VOLATILE);
       }
+      nir_def *known = nir_iand(nb, ev_ok, nir_ine_imm(nb, t[0], 0));
       struct vtn_pointer *vptr = vtn_value(b, w[3], vtn_value_type_pointer)->pointer;
-      nir_def *vdst = nir_u2u64(nb, vtn_pointer_to_ssa(b, vptr));
-      /* without control flow: before the times exist they go to the spare record */
-      vdst = nir_bcsel(nb, nir_ine_imm(nb, t[0], 0), vdst,
-                       nir_iadd_imm(nb, nir_load_default_queue_cl(nb), VTN_DEVQ_SPARE));
+      nir_def *dst = nir_u2u64(nb, vtn_pointer_to_ssa(b, vptr));
+      nir_def *vdst = nir_bcsel(nb, known, dst, vtn_devq_spare(nb));
       vtn_devq_store(nb, vdst, 0, t[0]);
       vtn_devq_store(nb, vdst, 8, t[1]);
 
+      /* the record goes to the event buffer, which has room for them even
+       * without a default queue
+       */
       unsigned size = VTN_DEVQ_REC_WAIT;
-      nir_def *res;
-      nir_def *rec = vtn_devq_reserve(nb, vtn_devq_default(nb), size, &res);
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_SIZE, nir_imm_int(nb, size));
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_KIND, nir_imm_int(nb, 3));
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_EVENT, nir_u2u32(nb, vtn_get_nir_ssa(b, w[1])));
+      nir_def *ok, *bad;
+      nir_def *rec = vtn_devq_reserve(nb, nir_load_default_queue_cl(nb), size,
+                                      nir_iand(nb, ev_ok, nir_inot(nb, known)),
+                                      false, &ok, &bad);
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_KIND,
+                     nir_bcsel(nb, ok, nir_imm_int(nb, 3), nir_imm_int(nb, 0)));
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_EVENT, nir_u2u32(nb, evt));
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_FLAGS, nir_u2u32(nb, vtn_get_nir_ssa(b, w[2])));
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_NUM_EVENTS, nir_imm_int(nb, 0));
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_WAIT_SLOTS, nir_imm_int(nb, 0));
       vtn_devq_store(nb, rec, VTN_DEVQ_REC_NUM_LOCALS, nir_imm_int(nb, 0));
-      struct vtn_pointer *ptr = vtn_value(b, w[3], vtn_value_type_pointer)->pointer;
-      nir_def *dst = vtn_pointer_to_ssa(b, ptr);
-      vtn_devq_store(nb, rec, VTN_DEVQ_REC_AUX, nir_u2u64(nb, dst));
+      vtn_devq_store(nb, rec, VTN_DEVQ_REC_AUX, dst);
       return;
    }
 
    case SpvOpRetainEvent:
    case SpvOpReleaseEvent:
-      /* events live as long as the queue's records */
+      /* event ids are not reused within a launch (see above) */
       return;
 
    case SpvOpCreateUserEvent: {
-      nir_def *q = nir_load_default_queue_cl(nb);
-      nir_def *id = vtn_devq_atomic_add(nb, q, VTN_DEVQ_NEXT_EVENT, nir_imm_int(nb, 1));
+      nir_def *id = vtn_devq_alloc_event(nb, nir_imm_true(nb));
       vtn_push_nir_ssa(b, w[2], nir_u2u64(nb, id));
       return;
    }
 
    case SpvOpIsValidEvent:
-      vtn_push_nir_ssa(b, w[2], nir_ine_imm(nb, vtn_get_nir_ssa(b, w[3]), 0));
+      vtn_push_nir_ssa(b, w[2], vtn_devq_event_valid(nb, vtn_get_nir_ssa(b, w[3])));
       return;
 
    case SpvOpSetUserEventStatus: {
-      nir_def *q = nir_load_default_queue_cl(nb);
-      nir_def *id = nir_u2u64(nb, nir_iand_imm(nb, nir_u2u32(nb, vtn_get_nir_ssa(b, w[1])),
-                                              VTN_DEVQ_MAX_EVENTS - 1));
-      nir_def *addr = nir_iadd(nb, nir_iadd_imm(nb, q, VTN_DEVQ_EVENTS), nir_imul_imm(nb, id, 4));
+      nir_def *addr = vtn_devq_event_slot(nb, vtn_get_nir_ssa(b, w[1]),
+                                          VTN_DEVQ_EVENTS, 4);
       vtn_devq_store(nb, addr, 0, nir_u2u32(nb, vtn_get_nir_ssa(b, w[2])));
       return;
    }
