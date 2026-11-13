@@ -335,11 +335,14 @@ panfrost_dev_query_props(struct pan_kmod_dev *dev)
 
    props->pgsize_bitmap = PAN_PGSIZE_4K | PAN_PGSIZE_2M;
 
-   /* Kernels without SAME_VA BOs reject the parameters. */
-   props->same_va_start =
-      panfrost_query_raw(dev, DRM_PANFROST_PARAM_SAME_VA_START, false, 0);
-   props->same_va_end =
-      panfrost_query_raw(dev, DRM_PANFROST_PARAM_SAME_VA_END, false, 0);
+   props->same_va_start = props->same_va_end = 0;
+   if (panfrost_query_raw(dev, DRM_PANFROST_PARAM_SAME_VA_ABI, false, 0) ==
+       PANFROST_SAME_VA_ABI_V1) {
+      props->same_va_start =
+         panfrost_query_raw(dev, DRM_PANFROST_PARAM_SAME_VA_START, false, 0);
+      props->same_va_end =
+         panfrost_query_raw(dev, DRM_PANFROST_PARAM_SAME_VA_END, false, 0);
+   }
    if (props->same_va_end > props->same_va_start)
       props->supported_bo_flags |= PAN_KMOD_BO_FLAG_SAME_VA;
    else

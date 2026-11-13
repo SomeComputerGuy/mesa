@@ -111,6 +111,9 @@ panfrost_ioctl_get_param(int fd, unsigned long request, void *arg)
       /* default for most hardware so far */
       gp->value = 0x00280030;
       return 0;
+   case DRM_PANFROST_PARAM_SAME_VA_ABI:
+      gp->value = PANFROST_SAME_VA_ABI_V1;
+      return 0;
    case DRM_PANFROST_PARAM_SAME_VA_START:
       gp->value = 1ull << 32;
       return 0;

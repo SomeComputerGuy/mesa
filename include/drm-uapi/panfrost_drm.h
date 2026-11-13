@@ -130,7 +130,6 @@ struct drm_panfrost_wait_bo {
 #define PANFROST_BO_NOEXEC	1
 #define PANFROST_BO_HEAP	2
 #define PANFROST_BO_WB_MMAP	4
-#define PANFROST_BO_SAME_VA	8
 
 /**
  * struct drm_panfrost_create_bo - ioctl argument for creating Panfrost BOs.
@@ -237,9 +236,21 @@ enum drm_panfrost_param {
 	DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY,
 	DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES,
 	DRM_PANFROST_PARAM_SELECTED_COHERENCY,
-	DRM_PANFROST_PARAM_SAME_VA_START,
-	DRM_PANFROST_PARAM_SAME_VA_END,
 };
+
+/*
+ * SAME_VA BOs are not part of the upstream panfrost uAPI. Their flag and
+ * parameter numbers lie far outside the ranges upstream allocates from (the
+ * low flag bits, the dense drm_panfrost_param enum), so they cannot collide
+ * with later upstream additions. Userspace uses PANFROST_BO_SAME_VA only
+ * when DRM_PANFROST_PARAM_SAME_VA_ABI returns PANFROST_SAME_VA_ABI_V1; any
+ * other kernel fails that query with -EINVAL.
+ */
+#define PANFROST_BO_SAME_VA			0x80000000
+#define DRM_PANFROST_PARAM_SAME_VA_ABI		0x4f5a5300
+#define DRM_PANFROST_PARAM_SAME_VA_START	0x4f5a5301
+#define DRM_PANFROST_PARAM_SAME_VA_END		0x4f5a5302
+#define PANFROST_SAME_VA_ABI_V1			0x4f50495a53560001ULL
 
 enum drm_panfrost_gpu_coherency {
 	DRM_PANFROST_GPU_COHERENCY_ACE_LITE = 0,
