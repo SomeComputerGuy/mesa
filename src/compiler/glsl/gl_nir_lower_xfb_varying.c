@@ -117,6 +117,28 @@ get_deref(nir_builder *b, const char *name, nir_variable *toplevel_var,
 
       *deref = nir_build_deref_var(b, toplevel_var);
       *type = toplevel_var->type;
+
+      /* A member of a named interface block is its own variable: the name
+       * is "Block[i].member...", the variable is the member (arrayed like
+       * the block instance), so skip the block subscripts and the member.
+       */
+      if (toplevel_var->data.from_named_ifc_block) {
+         while (name[0] == '[') {
+            char *endptr = NULL;
+            unsigned index = strtol(name + 1, &endptr, 10);
+            assert(glsl_type_is_array(*type) && endptr[0] == ']');
+            *deref = nir_build_deref_array_imm(b, *deref, index);
+            *type = glsl_get_array_element(*type);
+            name = endptr + 1;
+         }
+         if (name[0] != '.')
+            return false;
+         field = get_field_name(name + 1);
+         assert(field && strcmp(field, toplevel_var->name) == 0);
+         name += 1 + strlen(field);
+         free(field);
+      }
+
       return get_deref(b, name, NULL, deref, type);
    }
 }
