@@ -677,6 +677,13 @@ struct vtn_builder {
    struct nir_spirv_specialization *specialization;
 
    unsigned value_id_bound;
+
+   /* OpenCL: OpSpecConstantOp pointer casts and access chains that refer
+    * to ids defined later (the SPIR-V LLVM translator emits such forward
+    * references), as struct vtn_deferred_spec_op, handled once their
+    * operands exist
+    */
+   struct util_dynarray deferred_spec_ops;
    struct vtn_value *values;
 
    /* Information on the origin of the SPIR-V */

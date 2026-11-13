@@ -2691,9 +2691,36 @@ vtn_handle_pointer_spec_constant_op(struct vtn_builder *b,
                                     struct vtn_value *val, SpvOp opcode,
                                     const uint32_t *w, unsigned count)
 {
-   const struct vtn_type *src_type = vtn_get_value_type(b, w[4]);
    bool is_chain = false, is_ptr_chain = false;
 
+   /* integer arithmetic on an address: an address plus or minus a plain
+    * integer constant
+    */
+   if (opcode == SpvOpIAdd || opcode == SpvOpISub) {
+      struct vtn_value *a = vtn_untyped_value(b, w[4]);
+      struct vtn_value *c = vtn_untyped_value(b, w[5]);
+      bool a_ptr = a->value_type == vtn_value_type_constant && a->constant->pointer_target;
+      bool c_ptr = c->value_type == vtn_value_type_constant && c->constant->pointer_target;
+      if (!a_ptr && !c_ptr)
+         return false;
+      vtn_fail_if((a_ptr && c_ptr) || (c_ptr && opcode == SpvOpISub) ||
+                  !glsl_type_is_scalar(val->type->type),
+                  "Unsupported arithmetic on the address of a variable");
+      struct vtn_value *addr = a_ptr ? a : c;
+      struct vtn_value *other = a_ptr ? c : a;
+      vtn_fail_if(other->value_type != vtn_value_type_constant,
+                  "Unsupported arithmetic on the address of a variable");
+      unsigned bits = glsl_get_bit_size(val->type->type);
+      uint64_t offset = nir_const_value_as_uint(addr->constant->values[0], bits);
+      uint64_t v = nir_const_value_as_uint(other->constant->values[0],
+                                           glsl_get_bit_size(other->type->type));
+      offset = opcode == SpvOpIAdd ? offset + v : offset - v;
+      val->constant = vtn_pointer_constant(b, val->type,
+                                           addr->constant->pointer_target, offset);
+      return true;
+   }
+
+   const struct vtn_type *src_type = vtn_get_value_type(b, w[4]);
    switch (opcode) {
    case SpvOpBitcast:
    case SpvOpConvertPtrToU:
@@ -3269,6 +3296,9 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
          for (unsigned i = 0; i < src_count; i++) {
             src_val[i] = vtn_value(b, w[4 + i], vtn_value_type_constant);
             src_type[i] = src_val[i]->type->type;
+            /* folding would drop the address (OpenCL pointer initializers) */
+            vtn_fail_if(src_val[i]->constant->pointer_target,
+                        "Unsupported operation on the address of a variable");
          }
 
          const unsigned dst_bit_size =
@@ -6642,6 +6672,59 @@ spv_op_is_preamble(SpvOp opcode)
    }
 }
 
+struct vtn_deferred_spec_op {
+   const uint32_t *w;
+   unsigned count;
+};
+
+/* Whether an OpenCL OpSpecConstantOp on pointers refers to an id that is
+ * not defined yet (all its operands are ids)
+ */
+static bool
+vtn_spec_op_has_forward_ref(struct vtn_builder *b, const uint32_t *w,
+                            unsigned count)
+{
+   switch (w[3]) {
+   case SpvOpBitcast:
+   case SpvOpConvertPtrToU:
+   case SpvOpConvertUToPtr:
+   case SpvOpGenericCastToPtr:
+   case SpvOpPtrCastToGeneric:
+   case SpvOpAccessChain:
+   case SpvOpInBoundsAccessChain:
+   case SpvOpPtrAccessChain:
+   case SpvOpInBoundsPtrAccessChain:
+      break;
+   default:
+      return false;
+   }
+   for (unsigned i = 4; i < count; i++) {
+      if (w[i] < b->value_id_bound &&
+          b->values[w[i]].value_type == vtn_value_type_invalid)
+         return true;
+   }
+   return false;
+}
+
+static void
+vtn_handle_deferred_spec_ops(struct vtn_builder *b)
+{
+   bool progress;
+   do {
+      progress = false;
+      util_dynarray_foreach(&b->deferred_spec_ops, struct vtn_deferred_spec_op, d) {
+         if (vtn_spec_op_has_forward_ref(b, d->w, d->count))
+            continue;
+         struct vtn_deferred_spec_op op = *d;
+         util_dynarray_delete_unordered_ptr(&b->deferred_spec_ops,
+                                            struct vtn_deferred_spec_op, d);
+         vtn_handle_constant(b, SpvOpSpecConstantOp, op.w, op.count);
+         progress = true;
+         break;
+      }
+   } while (progress);
+}
+
 static bool
 vtn_handle_variable_or_type_instruction(struct vtn_builder *b, SpvOp opcode,
                                         const uint32_t *w, unsigned count)
@@ -6699,7 +6782,16 @@ vtn_handle_variable_or_type_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpSpecConstantCompositeReplicateEXT:
    case SpvOpSpecConstantOp:
    case SpvOpConstantSizeOfEXT:
+      if (opcode == SpvOpSpecConstantOp &&
+          b->options->environment == NIR_SPIRV_OPENCL &&
+          vtn_spec_op_has_forward_ref(b, w, count)) {
+         struct vtn_deferred_spec_op d = { w, count };
+         util_dynarray_append(&b->deferred_spec_ops, d);
+         return true;
+      }
       vtn_handle_constant(b, opcode, w, count);
+      if (b->deferred_spec_ops.size)
+         vtn_handle_deferred_spec_ops(b);
       break;
 
    case SpvOpUndef:
@@ -6707,6 +6799,8 @@ vtn_handle_variable_or_type_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpConstantSampler:
    case SpvOpUntypedVariableKHR:
       vtn_handle_variables(b, opcode, w, count);
+      if (b->deferred_spec_ops.size)
+         vtn_handle_deferred_spec_ops(b);
       break;
 
    case SpvOpExtInst:
@@ -7872,6 +7966,7 @@ vtn_create_builder(const uint32_t *words, size_t word_count,
    }
 
    b->value_id_bound = value_id_bound;
+   util_dynarray_init(&b->deferred_spec_ops, b);
 
    /* Allocate all the data that can be dropped after parsing using
     * a cheaper allocation strategy.  Use the value_id_bound and the
