@@ -3540,6 +3540,32 @@ panfrost_emit_poly_rast_state(struct panfrost_batch *batch,
    ctx->prog[vs] = rast;
 }
 
+/* Shader variants live in a growable array, so adding one (the
+ * outputs_to_memory variant of the vertex shader) may move the bound one:
+ * keep the bound vertex shader variant by index across these draws.
+ */
+static int
+panfrost_poly_save_vs(struct panfrost_context *ctx)
+{
+   struct panfrost_compiled_shader *vs = ctx->prog[MESA_SHADER_VERTEX];
+
+   if (!vs)
+      return -1;
+
+   return vs - (struct panfrost_compiled_shader *)util_dynarray_begin(
+                  &ctx->uncompiled[MESA_SHADER_VERTEX]->variants);
+}
+
+static void
+panfrost_poly_restore_vs(struct panfrost_context *ctx, int idx)
+{
+   ctx->prog[MESA_SHADER_VERTEX] =
+      idx < 0 ? NULL
+              : util_dynarray_element(
+                   &ctx->uncompiled[MESA_SHADER_VERTEX]->variants,
+                   struct panfrost_compiled_shader, idx);
+}
+
 /*
  * Run the vertex shader of a draw feeding a geometry or tessellation control
  * shader as a compute job (hardware attribute fetch, like the transform
@@ -3721,7 +3747,7 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
    if (skip_rast && !xfb && !queries)
       return;
 
-   struct panfrost_compiled_shader *saved_vs = ctx->prog[MESA_SHADER_VERTEX];
+   int saved_vs = panfrost_poly_save_vs(ctx);
 
    struct poly_geometry_params gp;
    uint32_t wg_gs[3] = {gs->wg_size, 1, 1};
@@ -3976,7 +4002,7 @@ panfrost_draw_with_gs(struct panfrost_batch *batch,
 
 out:
    /* The vertex-stage descriptors now belong to other programs */
-   ctx->prog[MESA_SHADER_VERTEX] = saved_vs;
+   panfrost_poly_restore_vs(ctx, saved_vs);
    ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_VERTEX;
    ctx->dirty_shader[MESA_SHADER_VERTEX] = ~0;
    ctx->dirty_shader[MESA_SHADER_GEOMETRY] = ~0;
@@ -4090,7 +4116,7 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
          return;
    }
 
-   struct panfrost_compiled_shader *saved_vs = ctx->prog[MESA_SHADER_VERTEX];
+   int saved_vs = panfrost_poly_save_vs(ctx);
 
    enum tess_primitive_mode mode = MAX2(tcs->primitive, tes->primitive);
    enum gl_tess_spacing spacing = MAX2(tcs->spacing, tes->spacing);
@@ -4275,7 +4301,7 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
          .index_count = max_indices,
       };
 
-      ctx->prog[MESA_SHADER_VERTEX] = saved_vs;
+      panfrost_poly_restore_vs(ctx, saved_vs);
       panfrost_draw_with_gs(batch, info, drawid_offset, draw, &in);
       goto out;
    }
@@ -4335,7 +4361,7 @@ panfrost_draw_with_tess(struct panfrost_batch *batch,
    }
 
 out:
-   ctx->prog[MESA_SHADER_VERTEX] = saved_vs;
+   panfrost_poly_restore_vs(ctx, saved_vs);
    ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_VERTEX;
    ctx->dirty_shader[MESA_SHADER_VERTEX] = ~0;
    ctx->dirty_shader[MESA_SHADER_TESS_CTRL] = ~0;
