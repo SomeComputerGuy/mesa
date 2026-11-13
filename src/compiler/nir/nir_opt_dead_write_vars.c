@@ -314,8 +314,7 @@ remove_dead_write_vars_local(nir_shader *shader, nir_block *block,
     */
    if (ends_program(block, is_entrypoint)) {
       util_dynarray_foreach_reverse(unused_writes, struct write_entry, entry) {
-         if (nir_deref_mode_may_be(entry->dst, nir_var_mem_shared) &&
-             nir_deref_mode_is(entry->dst, nir_var_mem_shared)) {
+         if (nir_deref_mode_must_be(entry->dst, nir_var_mem_shared)) {
             nir_instr_remove(&entry->intrin->instr);
             progress = true;
          }
