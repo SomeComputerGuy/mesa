@@ -747,7 +747,8 @@ lower_fs_layer_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
 /* CSO for a program derived from an application shader (libpoly lowering) */
 static struct panfrost_uncompiled_shader *
-panfrost_create_internal_shader(struct panfrost_context *ctx, nir_shader *nir)
+panfrost_create_internal_shader(struct panfrost_context *ctx, nir_shader *nir,
+                                bool precompile)
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
 
@@ -769,8 +770,11 @@ panfrost_create_internal_shader(struct panfrost_context *ctx, nir_shader *nir)
       panfrost_collect_vs_varying_layout(dev, so, nir);
 
    /* Precompile with the default key */
-   struct panfrost_shader_key key = {0};
-   panfrost_new_variant_locked(ctx, so, &key);
+   if (precompile) {
+      struct panfrost_shader_key key = {0};
+      panfrost_new_variant_locked(ctx, so, &key);
+   }
+
    return so;
 }
 
@@ -787,8 +791,8 @@ panfrost_create_gs_progs(struct panfrost_context *ctx,
                          &pre_gs_nir, &rast_nir, &gs->wg_size,
                          &gs->vertex_stride);
 
-   gs->main = panfrost_create_internal_shader(ctx, main_nir);
-   gs->pre_gs = panfrost_create_internal_shader(ctx, pre_gs_nir);
+   gs->main = panfrost_create_internal_shader(ctx, main_nir, true);
+   gs->pre_gs = panfrost_create_internal_shader(ctx, pre_gs_nir, true);
    gs->xfb = gs->info.xfb;
 
    if (so->nir->xfb_info) {
@@ -796,9 +800,9 @@ panfrost_create_gs_progs(struct panfrost_context *ctx,
          gs->xfb_stride[i] = so->nir->xfb_info->buffers[i].stride;
    }
 
-   gs->rast = panfrost_create_internal_shader(ctx, rast_nir);
+   gs->rast = panfrost_create_internal_shader(ctx, rast_nir, true);
    if (count_nir)
-      gs->count = panfrost_create_internal_shader(ctx, count_nir);
+      gs->count = panfrost_create_internal_shader(ctx, count_nir, true);
 
    so->gs = gs;
 }
@@ -820,9 +824,12 @@ panfrost_create_tess_progs(struct panfrost_context *ctx,
 
    if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
       t->output_stride = poly_tcs_output_stride(nir);
-      t->tcs = panfrost_create_internal_shader(ctx, panfrost_nir_lower_tcs(nir));
+      t->tcs = panfrost_create_internal_shader(ctx, panfrost_nir_lower_tcs(nir),
+                                               true);
    } else {
-      t->tes = panfrost_create_internal_shader(ctx, panfrost_nir_lower_tes(nir));
+      /* Not used when a geometry shader stage follows: compiled on use */
+      t->tes = panfrost_create_internal_shader(ctx, panfrost_nir_lower_tes(nir),
+                                               false);
    }
 
    so->tess = t;
@@ -867,6 +874,44 @@ panfrost_keep_outputs_nir(void *mem_ctx, const nir_shader *nir)
    return shell;
 }
 
+/* A passthrough geometry shader depends only on the outputs written and the
+ * transform feedback layout of the stage before it.
+ */
+static void
+panfrost_hash_outputs_nir(const nir_shader *nir, uint8_t *out)
+{
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, &nir->info.outputs_written,
+                       sizeof(nir->info.outputs_written));
+   bool xfb = nir->info.has_transform_feedback_varyings;
+   _mesa_blake3_update(&ctx, &xfb, sizeof(xfb));
+   _mesa_blake3_update(&ctx, nir->info.xfb_stride,
+                       sizeof(nir->info.xfb_stride));
+   if (nir->xfb_info) {
+      _mesa_blake3_update(&ctx, nir->xfb_info,
+                          nir_xfb_info_size(nir->xfb_info->output_count));
+   }
+   _mesa_blake3_final(&ctx, out);
+}
+
+struct panfrost_passthrough_gs_key {
+   uint8_t outputs_blake3[32];
+   uint32_t mode;
+};
+
+static uint32_t
+panfrost_passthrough_gs_key_hash(const void *key)
+{
+   return _mesa_hash_data(key, sizeof(struct panfrost_passthrough_gs_key));
+}
+
+static bool
+panfrost_passthrough_gs_key_equal(const void *a, const void *b)
+{
+   return !memcmp(a, b, sizeof(struct panfrost_passthrough_gs_key));
+}
+
 static void *
 panfrost_create_shader_state(struct pipe_context *pctx,
                              const struct pipe_shader_state *cso);
@@ -879,7 +924,7 @@ panfrost_get_tes_compute(struct panfrost_context *ctx,
 
    if (!t->tes_cs) {
       t->tes_cs = panfrost_create_internal_shader(
-         ctx, panfrost_nir_lower_tes_to_compute(tes->nir));
+         ctx, panfrost_nir_lower_tes_to_compute(tes->nir), true);
    }
 
    return t->tes_cs;
@@ -892,21 +937,48 @@ panfrost_get_passthrough_gs(struct panfrost_context *ctx,
 {
    assert(mode < MESA_PRIM_COUNT && prev->outputs_nir);
 
-   if (!prev->passthrough_gs[mode]) {
-      nir_shader *gs = nir_create_passthrough_gs(
-         ctx->base.screen->nir_options[MESA_SHADER_GEOMETRY],
-         prev->outputs_nir, mode, mode, false, false, false);
+   struct panfrost_passthrough_gs_key key = {.mode = mode};
+   memcpy(key.outputs_blake3, prev->outputs_blake3, sizeof(key.outputs_blake3));
 
-      struct pipe_shader_state state = {
-         .type = PIPE_SHADER_IR_NIR,
-         .ir.nir = gs,
-      };
-
-      prev->passthrough_gs[mode] =
-         panfrost_create_shader_state(&ctx->base, &state);
+   if (!ctx->passthrough_gs) {
+      ctx->passthrough_gs =
+         _mesa_hash_table_create(NULL, panfrost_passthrough_gs_key_hash,
+                                 panfrost_passthrough_gs_key_equal);
    }
 
-   return prev->passthrough_gs[mode];
+   struct hash_entry *he = _mesa_hash_table_search(ctx->passthrough_gs, &key);
+   if (he)
+      return he->data;
+
+   nir_shader *nir = nir_create_passthrough_gs(
+      ctx->base.screen->nir_options[MESA_SHADER_GEOMETRY], prev->outputs_nir,
+      mode, mode, false, false, false);
+
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = nir,
+   };
+
+   struct panfrost_uncompiled_shader *gs =
+      panfrost_create_shader_state(&ctx->base, &state);
+
+   struct panfrost_passthrough_gs_key *stored =
+      ralloc_memdup(ctx->passthrough_gs, &key, sizeof(key));
+   _mesa_hash_table_insert(ctx->passthrough_gs, stored, gs);
+   return gs;
+}
+
+void
+panfrost_passthrough_gs_cache_destroy(struct panfrost_context *ctx)
+{
+   if (!ctx->passthrough_gs)
+      return;
+
+   hash_table_foreach(ctx->passthrough_gs, he)
+      panfrost_delete_shader_state(&ctx->base, he->data);
+
+   _mesa_hash_table_destroy(ctx->passthrough_gs, NULL);
+   ctx->passthrough_gs = NULL;
 }
 
 static void *
@@ -932,8 +1004,10 @@ panfrost_create_shader_state(struct pipe_context *pctx,
    if ((nir->info.stage == MESA_SHADER_VERTEX ||
         nir->info.stage == MESA_SHADER_TESS_EVAL) &&
        pan_device(pctx->screen)->arch >= 6 &&
-       pan_device(pctx->screen)->arch <= 7)
+       pan_device(pctx->screen)->arch <= 7) {
       so->outputs_nir = panfrost_keep_outputs_nir(so, nir);
+      panfrost_hash_outputs_nir(so->outputs_nir, so->outputs_blake3);
+   }
 
    /* PLS lowering is not taken care of by glsl_to_nir(), so do it here. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
@@ -1106,11 +1180,6 @@ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
       if (cso->gs->count)
          panfrost_delete_shader_state(pctx, cso->gs->count);
       panfrost_delete_shader_state(pctx, cso->gs->pre_gs);
-   }
-
-   for (unsigned i = 0; i < ARRAY_SIZE(cso->passthrough_gs); ++i) {
-      if (cso->passthrough_gs[i])
-         panfrost_delete_shader_state(pctx, cso->passthrough_gs[i]);
    }
 
    if (cso->tess) {

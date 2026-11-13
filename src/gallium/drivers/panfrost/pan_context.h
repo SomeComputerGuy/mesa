@@ -154,6 +154,11 @@ struct panfrost_context {
    /* Map from resources to panfrost_batches */
    struct hash_table *writers;
 
+   /* Passthrough geometry shaders by output interface and input primitive,
+    * shared by the vertex and tessellation evaluation shaders they fit.
+    */
+   struct hash_table *passthrough_gs;
+
    /* Current batches */
    struct panfrost_batch *batch[PANFROST_BATCH_TYPE_COUNT];
 
@@ -613,10 +618,10 @@ struct panfrost_uncompiled_shader {
     * holding only the output variables and the transform feedback info, to
     * build passthrough geometry shaders from (adjacency draws without a
     * geometry shader, transform feedback and queries after tessellation),
-    * and those geometry shaders, by input primitive.
+    * and the hash of what such a geometry shader depends on.
     */
    nir_shader *outputs_nir;
-   struct panfrost_uncompiled_shader *passthrough_gs[MESA_PRIM_COUNT];
+   uint8_t outputs_blake3[32];
 
    /* On fragments shaders, bit mask of varyings using noprespective
     * interpolation, starting at VARYING_SLOT_VAR0 */
@@ -783,6 +788,8 @@ void panfrost_for_each_fb_layer(struct panfrost_context *ctx,
 struct panfrost_uncompiled_shader *
 panfrost_get_tes_compute(struct panfrost_context *ctx,
                          struct panfrost_uncompiled_shader *tes);
+void panfrost_passthrough_gs_cache_destroy(struct panfrost_context *ctx);
+
 struct panfrost_uncompiled_shader *
 panfrost_get_passthrough_gs(struct panfrost_context *ctx,
                             struct panfrost_uncompiled_shader *prev,

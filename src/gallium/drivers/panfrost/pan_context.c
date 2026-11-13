@@ -665,6 +665,7 @@ panfrost_destroy(struct pipe_context *pipe)
    struct panfrost_context *panfrost = pan_context(pipe);
    struct panfrost_device *dev = pan_device(pipe->screen);
 
+   panfrost_passthrough_gs_cache_destroy(panfrost);
    pan_screen(pipe->screen)->vtbl.context_cleanup(panfrost);
 
    if (dev->arch >= 10) {
