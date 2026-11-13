@@ -1178,8 +1178,14 @@ panfrost_upload_image_size_sysval(struct panfrost_batch *batch,
    if (dim > 2)
       uniform->i[2] = u_minify(image->resource->depth0, image->u.tex.level);
 
-   if (is_array)
-      uniform->i[dim] = image->resource->array_size;
+   if (is_array) {
+      unsigned size = image->resource->array_size;
+
+      if (image->resource->target == PIPE_TEXTURE_CUBE_ARRAY)
+         size /= 6;
+
+      uniform->i[dim] = size;
+   }
 }
 
 static void
