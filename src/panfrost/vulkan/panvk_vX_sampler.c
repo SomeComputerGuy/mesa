@@ -127,12 +127,14 @@ panvk_sampler_fill_desc(const struct VkSamplerCreateInfo *info,
        * is used with VK_FILTER_NEAREST.
        *
        * Regardless, disabling round_to_nearest_even for NEAREST filters
-       * is a desirable precision improvement.
+       * is a desirable precision improvement. The Arm driver keys it on the
+       * minification filter alone: with a linear magnify filter, a nearest
+       * minify at the 1x1 level of a seamless cube would otherwise pick the
+       * neighbouring face near an edge.
        *
        * [1]: https://gitlab.khronos.org/Tracker/vk-gl-cts/-/issues/5547
        */
-      if (min_filter == VK_FILTER_NEAREST &&
-          mag_filter == VK_FILTER_NEAREST)
+      if (min_filter == VK_FILTER_NEAREST)
          cfg.round_to_nearest_even = false;
 
       cfg.lod_bias = info->mipLodBias;
