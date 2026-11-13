@@ -4667,6 +4667,56 @@ panfrost_layered_draw_one(struct panfrost_context *ctx, unsigned layer,
 }
 
 /*
+ * Vertex shader transform feedback runs as a compute job over the vertices of
+ * a non-indexed list draw. Indexed draws, strips, fans and loops, and draws
+ * that overflow a buffer (allowed with OES_geometry_shader: only whole
+ * primitives are written) go through a passthrough geometry shader instead.
+ */
+static bool
+panfrost_vs_xfb_needs_gs(struct panfrost_context *ctx,
+                         const struct pipe_draw_info *info,
+                         const struct pipe_draw_indirect_info *indirect,
+                         const struct pipe_draw_start_count_bias *draws,
+                         unsigned num_draws)
+{
+   struct panfrost_uncompiled_shader *vs = ctx->uncompiled[MESA_SHADER_VERTEX];
+   const nir_xfb_info *xfb =
+      vs && vs->outputs_nir ? vs->outputs_nir->xfb_info : NULL;
+
+   if (!xfb || !ctx->streamout.num_targets)
+      return false;
+
+   if (info->index_size || (info->mode != MESA_PRIM_POINTS &&
+                            info->mode != MESA_PRIM_LINES &&
+                            info->mode != MESA_PRIM_TRIANGLES))
+      return true;
+
+   if (indirect && indirect->buffer)
+      return false;
+
+   unsigned vertices = 0;
+   for (unsigned i = 0; i < num_draws; ++i) {
+      unsigned count = draws[i].count;
+      if (u_trim_pipe_prim(info->mode, &count))
+         vertices += count;
+   }
+   vertices *= info->instance_count;
+
+   for (unsigned i = 0; i < ctx->streamout.num_targets &&
+                        i < ARRAY_SIZE(xfb->buffers); ++i) {
+      struct pipe_stream_output_target *target = ctx->streamout.targets[i];
+      uint64_t stride = xfb->buffers[i].stride;
+
+      if (target && stride &&
+          (pan_so_target(target)->offset + (uint64_t)vertices) * stride >
+             target->buffer_size)
+         return true;
+   }
+
+   return false;
+}
+
+/*
  * Draws that need a geometry shader stage when none is bound: adjacency
  * primitives (only a geometry shader sees them), and transform feedback and
  * primitive queries after tessellation (the geometry shader path counts and
@@ -4674,7 +4724,10 @@ panfrost_layered_draw_one(struct panfrost_context *ctx, unsigned layer,
  */
 static bool
 panfrost_needs_passthrough_gs(struct panfrost_context *ctx,
-                              const struct pipe_draw_info *info)
+                              const struct pipe_draw_info *info,
+                              const struct pipe_draw_indirect_info *indirect,
+                              const struct pipe_draw_start_count_bias *draws,
+                              unsigned num_draws)
 {
    if (ctx->uncompiled[MESA_SHADER_GEOMETRY])
       return false;
@@ -4685,7 +4738,7 @@ panfrost_needs_passthrough_gs(struct panfrost_context *ctx,
    struct panfrost_uncompiled_shader *tes =
       ctx->uncompiled[MESA_SHADER_TESS_EVAL];
    if (!tes)
-      return false;
+      return panfrost_vs_xfb_needs_gs(ctx, info, indirect, draws, num_draws);
 
    bool xfb = tes->nir->xfb_info && ctx->streamout.num_targets > 0;
    bool queries = ctx->nr_prim_queries > 0 && ctx->active_queries;
@@ -4856,7 +4909,7 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
    }
 
-   if (panfrost_needs_passthrough_gs(ctx, info)) {
+   if (panfrost_needs_passthrough_gs(ctx, info, indirect, draws, num_draws)) {
       panfrost_draw_passthrough_gs(pipe, info, drawid_offset, indirect, draws,
                                    num_draws);
       return;
