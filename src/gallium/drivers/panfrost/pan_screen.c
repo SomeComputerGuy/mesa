@@ -601,8 +601,19 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       caps->max_tex_instructions =
       caps->max_tex_indirections = 16384; /* arbitrary */
       caps->max_control_flow_depth = 1024; /* arbitrary */
-      /* Used as ABI on Midgard */
-      caps->max_inputs = dev->arch >= 9 ? 32 : 16;
+      /* Used as ABI on Midgard. On Bifrost, the fragment shader reads as
+       * many varyings as the stages before it write (geometry shaders write
+       * 128 components), and tessellation inputs are memory loads (libpoly),
+       * as on the Arm driver (128 components).
+       */
+      if (dev->arch >= 9)
+         caps->max_inputs = 32;
+      else if (dev->arch >= 6 && (i == MESA_SHADER_FRAGMENT ||
+                                  i == MESA_SHADER_TESS_CTRL ||
+                                  i == MESA_SHADER_TESS_EVAL))
+         caps->max_inputs = 32;
+      else
+         caps->max_inputs = 16;
       caps->max_outputs = i == MESA_SHADER_FRAGMENT ? 8 : PIPE_MAX_ATTRIBS;
       caps->max_temps = 256; /* arbitrary */
       caps->max_const_buffer0_size = 16 * 1024 * sizeof(float);
