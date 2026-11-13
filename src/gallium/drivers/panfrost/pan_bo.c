@@ -93,6 +93,7 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
    if (flags & PAN_BO_SAME_VA) {
       bo->flags = flags;
       bo->dev = dev;
+      simple_mtx_init(&bo->lock, mtx_plain);
       return bo;
    }
 
