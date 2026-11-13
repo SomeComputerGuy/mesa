@@ -57,7 +57,7 @@ tcs_out_addr(nir_builder *b, nir_intrinsic_instr *intr, nir_def *vertex_id)
 }
 
 static nir_def *
-lower_tes_load(nir_builder *b, nir_intrinsic_instr *intr)
+lower_tes_load(nir_builder *b, nir_intrinsic_instr *intr, nir_def *patch)
 {
    gl_varying_slot location = nir_intrinsic_io_semantics(intr).location;
    nir_src *offset_src = nir_get_io_offset_src(intr);
@@ -68,9 +68,9 @@ lower_tes_load(nir_builder *b, nir_intrinsic_instr *intr)
    if (intr->intrinsic == nir_intrinsic_load_per_vertex_input)
       vertex = intr->src[0].ssa;
 
-   nir_def *addr = poly_tes_in_address(b, nir_load_tess_param_buffer_poly(b),
-                                       nir_load_vertex_id(b), vertex,
-                                       nir_iadd_imm(b, offset, location));
+   nir_def *addr = poly_tes_in_address_patch(
+      b, nir_load_tess_param_buffer_poly(b), patch, vertex,
+      nir_iadd_imm(b, offset, location));
 
    if (nir_intrinsic_has_component(intr))
       addr = nir_iadd_imm(b, addr, nir_intrinsic_component(intr) * 4);
@@ -227,20 +227,23 @@ poly_nir_lower_tcs(nir_shader *tcs, bool can_ignore_shader_out_barriers)
 static nir_def *
 lower_tes_impl(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   /* Patch of the invocation, computed once at the top of the shader */
+   nir_def *patch = data;
+
    switch (intr->intrinsic) {
    case nir_intrinsic_load_tess_coord_xy:
-      return poly_load_tess_coord(b, nir_load_tess_param_buffer_poly(b),
-                                  nir_load_vertex_id(b));
+      return poly_load_tess_coord_patch(b, nir_load_tess_param_buffer_poly(b),
+                                        nir_load_vertex_id(b), patch);
 
    case nir_intrinsic_load_primitive_id:
-      return poly_tes_patch_id(b, nir_load_tess_param_buffer_poly(b),
-                               nir_load_vertex_id(b));
+      return poly_tes_patch_id_from_unrolled(
+         b, nir_load_tess_param_buffer_poly(b), patch);
 
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_per_vertex_input:
    case nir_intrinsic_load_tess_level_inner:
    case nir_intrinsic_load_tess_level_outer:
-      return lower_tes_load(b, intr);
+      return lower_tes_load(b, intr, patch);
 
    case nir_intrinsic_load_patch_vertices_in:
       return poly_tes_patch_vertices_in(b, nir_load_tess_param_buffer_poly(b));
@@ -283,7 +286,16 @@ poly_nir_lower_tes(nir_shader *tes, bool to_hw_vs)
    nir_lower_tess_coord_z(
       tes, tes->info.tess._primitive_mode == TESS_PRIMITIVE_TRIANGLES);
 
-   nir_shader_intrinsics_pass(tes, lower_tes, nir_metadata_control_flow, NULL);
+   /* Finding the patch of a domain point can take a loop: do it once, not
+    * per input load.
+    */
+   nir_function_impl *impl = nir_shader_get_entrypoint(tes);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *patch = poly_tes_unrolled_patch(
+      &b, nir_load_tess_param_buffer_poly(&b), nir_load_vertex_id(&b));
+   nir_progress(true, impl, nir_metadata_none);
+
+   nir_shader_intrinsics_pass(tes, lower_tes, nir_metadata_none, patch);
 
    /* Points mode renders as points, make sure we write point size for the HW */
    if (tes->info.tess.point_mode && to_hw_vs) {

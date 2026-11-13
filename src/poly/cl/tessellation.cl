@@ -104,10 +104,48 @@ tes_unrolled_patch_id(constant struct poly_tess_params *p, uint raw_id)
       return raw_id / POLY_TES_PATCH_ID_STRIDE;
 }
 
+/* The patch of a domain point, before the instance is split off. The
+ * evaluation shader lowering computes it once per invocation (a search over
+ * the patches for dense points) and passes it to the *_patch helpers below.
+ */
+uint
+poly_tes_unrolled_patch(constant struct poly_tess_params *p, uint raw_id)
+{
+   return tes_unrolled_patch_id(p, raw_id);
+}
+
+uint
+poly_tes_patch_id_from_unrolled(constant struct poly_tess_params *p,
+                                uint patch)
+{
+   return patch % p->patches_per_instance;
+}
+
 uint
 poly_tes_patch_id(constant struct poly_tess_params *p, uint raw_id)
 {
    return tes_unrolled_patch_id(p, raw_id) % p->patches_per_instance;
+}
+
+float2
+poly_load_tess_coord_patch(constant struct poly_tess_params *p, uint raw_id,
+                           uint patch)
+{
+   uint vtx;
+
+   if (p->point_counts)
+      vtx = raw_id - (patch == 0 ? 0 : p->point_counts[patch - 1]);
+   else
+      vtx = raw_id % POLY_TES_PATCH_ID_STRIDE;
+
+   global struct poly_tess_point *t =
+      &p->patch_coord_buffer[p->coord_allocs[patch] + vtx];
+
+   /* Written weirdly because NIR struggles with loads of structs */
+   uint2 fixed = *((global uint2 *)t);
+
+   /* Convert fixed point to float */
+   return convert_float2(fixed) / (1u << 16);
 }
 
 float2
@@ -131,6 +169,15 @@ poly_load_tess_coord(constant struct poly_tess_params *p, uint raw_id)
 
    /* Convert fixed point to float */
    return convert_float2(fixed) / (1u << 16);
+}
+
+uintptr_t
+poly_tes_in_address_patch(constant struct poly_tess_params *p, uint patch,
+                          uint vtx_id, gl_varying_slot location)
+{
+   return poly_tcs_out_address(p, patch, vtx_id, location,
+                               p->tcs_patch_constants, p->output_patch_size,
+                               p->tcs_per_vertex_outputs);
 }
 
 uintptr_t
