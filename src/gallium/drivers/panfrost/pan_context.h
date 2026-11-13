@@ -159,6 +159,11 @@ struct panfrost_context {
     */
    struct hash_table *passthrough_gs;
 
+   /* Lowered geometry and tessellation programs by NIR hash, shared by the
+    * CSOs of identical shaders.
+    */
+   struct hash_table *lowered_progs;
+
    /* Current batches */
    struct panfrost_batch *batch[PANFROST_BATCH_TYPE_COUNT];
 
@@ -794,6 +799,7 @@ struct panfrost_uncompiled_shader *
 panfrost_get_tes_compute(struct panfrost_context *ctx,
                          struct panfrost_uncompiled_shader *tes);
 void panfrost_passthrough_gs_cache_destroy(struct panfrost_context *ctx);
+void panfrost_lowered_progs_cache_destroy(struct panfrost_context *ctx);
 
 struct panfrost_uncompiled_shader *
 panfrost_get_passthrough_gs(struct panfrost_context *ctx,

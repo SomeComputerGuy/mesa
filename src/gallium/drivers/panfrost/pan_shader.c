@@ -784,11 +784,91 @@ panfrost_create_internal_shader(struct panfrost_context *ctx, nir_shader *nir,
 
 static void panfrost_delete_shader_state(struct pipe_context *pctx, void *so);
 
+struct panfrost_lowered_progs {
+   uint8_t nir_blake3[32];
+   struct panfrost_gs_progs *gs;
+   struct panfrost_tess_progs *tess;
+};
+
+static uint32_t
+panfrost_blake3_key_hash(const void *key)
+{
+   return _mesa_hash_data(key, 32);
+}
+
+static bool
+panfrost_blake3_key_equal(const void *a, const void *b)
+{
+   return !memcmp(a, b, 32);
+}
+
+/* Programs relinked per draw recreate the same CSOs: lower them once */
+static struct panfrost_lowered_progs *
+panfrost_get_lowered_progs(struct panfrost_context *ctx,
+                           struct panfrost_uncompiled_shader *so, bool *found)
+{
+   if (!ctx->lowered_progs) {
+      ctx->lowered_progs = _mesa_hash_table_create(
+         NULL, panfrost_blake3_key_hash, panfrost_blake3_key_equal);
+   }
+
+   struct hash_entry *he =
+      _mesa_hash_table_search(ctx->lowered_progs, so->nir_blake3);
+   *found = he != NULL;
+   if (he)
+      return he->data;
+
+   struct panfrost_lowered_progs *l =
+      rzalloc(ctx->lowered_progs, struct panfrost_lowered_progs);
+   memcpy(l->nir_blake3, so->nir_blake3, sizeof(l->nir_blake3));
+   _mesa_hash_table_insert(ctx->lowered_progs, l->nir_blake3, l);
+   return l;
+}
+
+void
+panfrost_lowered_progs_cache_destroy(struct panfrost_context *ctx)
+{
+   if (!ctx->lowered_progs)
+      return;
+
+   hash_table_foreach(ctx->lowered_progs, he) {
+      struct panfrost_lowered_progs *l = he->data;
+
+      if (l->gs) {
+         panfrost_delete_shader_state(&ctx->base, l->gs->main);
+         panfrost_delete_shader_state(&ctx->base, l->gs->rast);
+         if (l->gs->count)
+            panfrost_delete_shader_state(&ctx->base, l->gs->count);
+         panfrost_delete_shader_state(&ctx->base, l->gs->pre_gs);
+      }
+
+      if (l->tess) {
+         if (l->tess->tcs)
+            panfrost_delete_shader_state(&ctx->base, l->tess->tcs);
+         if (l->tess->tes)
+            panfrost_delete_shader_state(&ctx->base, l->tess->tes);
+         if (l->tess->tes_cs)
+            panfrost_delete_shader_state(&ctx->base, l->tess->tes_cs);
+      }
+   }
+
+   _mesa_hash_table_destroy(ctx->lowered_progs, NULL);
+   ctx->lowered_progs = NULL;
+}
+
 static void
 panfrost_create_gs_progs(struct panfrost_context *ctx,
                          struct panfrost_uncompiled_shader *so)
 {
-   struct panfrost_gs_progs *gs = rzalloc(so, struct panfrost_gs_progs);
+   bool found;
+   struct panfrost_lowered_progs *l =
+      panfrost_get_lowered_progs(ctx, so, &found);
+   if (found) {
+      so->gs = l->gs;
+      return;
+   }
+
+   struct panfrost_gs_progs *gs = rzalloc(l, struct panfrost_gs_progs);
    nir_shader *main_nir, *count_nir, *pre_gs_nir, *rast_nir;
 
    panfrost_nir_lower_gs(so->nir, &gs->info, &main_nir, &count_nir,
@@ -808,15 +888,23 @@ panfrost_create_gs_progs(struct panfrost_context *ctx,
    if (count_nir)
       gs->count = panfrost_create_internal_shader(ctx, count_nir, true);
 
-   so->gs = gs;
+   so->gs = l->gs = gs;
 }
 
 static void
 panfrost_create_tess_progs(struct panfrost_context *ctx,
                            struct panfrost_uncompiled_shader *so)
 {
+   bool found;
+   struct panfrost_lowered_progs *l =
+      panfrost_get_lowered_progs(ctx, so, &found);
+   if (found) {
+      so->tess = l->tess;
+      return;
+   }
+
    const nir_shader *nir = so->nir;
-   struct panfrost_tess_progs *t = rzalloc(so, struct panfrost_tess_progs);
+   struct panfrost_tess_progs *t = rzalloc(l, struct panfrost_tess_progs);
 
    t->primitive = nir->info.tess._primitive_mode;
    t->spacing = nir->info.tess.spacing;
@@ -836,7 +924,7 @@ panfrost_create_tess_progs(struct panfrost_context *ctx,
                                                false);
    }
 
-   so->tess = t;
+   so->tess = l->tess = t;
 }
 
 /* Keep the output variables and the transform feedback info of a vertex or
@@ -1182,22 +1270,7 @@ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
       free(cso->xfb);
    }
 
-   if (cso->gs) {
-      panfrost_delete_shader_state(pctx, cso->gs->main);
-      panfrost_delete_shader_state(pctx, cso->gs->rast);
-      if (cso->gs->count)
-         panfrost_delete_shader_state(pctx, cso->gs->count);
-      panfrost_delete_shader_state(pctx, cso->gs->pre_gs);
-   }
-
-   if (cso->tess) {
-      if (cso->tess->tcs)
-         panfrost_delete_shader_state(pctx, cso->tess->tcs);
-      if (cso->tess->tes)
-         panfrost_delete_shader_state(pctx, cso->tess->tes);
-      if (cso->tess->tes_cs)
-         panfrost_delete_shader_state(pctx, cso->tess->tes_cs);
-   }
+   /* cso->gs and cso->tess belong to ctx->lowered_progs */
 
    simple_mtx_destroy(&cso->lock);
 
