@@ -623,6 +623,11 @@ struct panfrost_uncompiled_shader {
    nir_shader *outputs_nir;
    uint8_t outputs_blake3[32];
 
+   /* Vertex shader with its transform feedback-only outputs, for
+    * outputs_to_memory variants.
+    */
+   nir_shader *mem_nir;
+
    /* On fragments shaders, bit mask of varyings using noprespective
     * interpolation, starting at VARYING_SLOT_VAR0 */
    uint32_t noperspective_varyings;

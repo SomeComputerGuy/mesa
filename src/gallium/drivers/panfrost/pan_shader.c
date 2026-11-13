@@ -277,7 +277,11 @@ panfrost_shader_get(struct pipe_screen *pscreen,
                         state->key.fs.vs_varying_layout.known != 0;
       const struct pan_varying_layout *varying_layout =
          use_layout ? &uncompiled->vs_varying_layout : NULL;
-      panfrost_shader_compile(screen, uncompiled->nir, dbg, varying_layout,
+      const nir_shader *nir =
+         state->key.vs.outputs_to_memory && uncompiled->mem_nir
+            ? uncompiled->mem_nir
+            : uncompiled->nir;
+      panfrost_shader_compile(screen, nir, dbg, varying_layout,
                               &state->key, req_local_mem, &res);
 
       panfrost_disk_cache_store(screen->disk_cache, uncompiled, &state->key,
@@ -1124,6 +1128,10 @@ panfrost_create_shader_state(struct pipe_context *pctx,
 
       panfrost_shader_get(ctx->base.screen, &ctx->shaders, &ctx->descs, so,
                           &ctx->base.debug, so->xfb, 0);
+
+      /* The passthrough geometry shader captures them from memory */
+      if (so->outputs_nir)
+         so->mem_nir = nir_shader_clone(so, nir);
 
       /* Since transform feedback is handled via the transform
        * feedback program, the original program no longer uses XFB
