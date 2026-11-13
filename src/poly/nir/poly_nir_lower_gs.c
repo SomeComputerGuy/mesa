@@ -521,6 +521,8 @@ struct lower_gs_rast_state {
    bool points;
 
    nir_variable *output_strip_length, *output_strip_base, *id_in_strip;
+   nir_variable *in_primitive;
+   unsigned verts_per_prim;
 };
 
 static void
@@ -602,6 +604,12 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       orig = nir_load_var(b, state->id_in_strip);
       value = nir_bcsel(b, us, id_in_strip, orig);
       nir_store_var(b, state->id_in_strip, value, nir_component_mask(1));
+
+      nir_def *complete =
+         nir_uge_imm(b, length, state->verts_per_prim);
+      nir_def *covered = nir_ior(b, nir_load_var(b, state->in_primitive),
+                                 nir_iand(b, us, complete));
+      nir_store_var(b, state->in_primitive, covered, nir_component_mask(1));
 
       nir_instr_remove(&intr->instr);
       return true;
@@ -703,7 +711,16 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       .output_strip_length = nir_local_variable_create(b->impl, T, NULL),
       .output_strip_base = nir_local_variable_create(b->impl, T, NULL),
       .id_in_strip = nir_local_variable_create(b->impl, T, NULL),
+      .in_primitive =
+         nir_local_variable_create(b->impl, glsl_bool_type(), NULL),
+      .verts_per_prim = mesa_vertices_per_prim(gs->info.gs.output_primitive),
    };
+
+   nir_def *zero_ = nir_imm_int(b, 0);
+   nir_store_var(b, rs.output_strip_length, zero_, nir_component_mask(1));
+   nir_store_var(b, rs.output_strip_base, zero_, nir_component_mask(1));
+   nir_store_var(b, rs.id_in_strip, zero_, nir_component_mask(1));
+   nir_store_var(b, rs.in_primitive, nir_imm_false(b), nir_component_mask(1));
 
    raw_vertex_id = nir_udiv_imm(b, raw_vertex_id, stream_multiplier(gs));
 
@@ -793,6 +810,11 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
 
       nir_def *n = nir_imm_int(b, n_);
 
+      /* Hardware shading every vertex ID also runs IDs that are not part of
+       * a complete emitted primitive: they must not write.
+       */
+      nir_push_if(b, nir_load_var(b, rs.in_primitive));
+
       for (unsigned p_ = 0; p_ < n_; ++p_) {
          nir_def *p = nir_imm_int(b, p_);
          nir_push_if(b, poly_xfb_vertex_copy_in_strip(b, n, id_in_strip,
@@ -850,6 +872,8 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
          }
          nir_pop_if(b, NULL);
       }
+
+      nir_pop_if(b, NULL);
    }
 
    /* Forward each selected output to the rasterizer */
