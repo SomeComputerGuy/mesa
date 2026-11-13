@@ -484,22 +484,12 @@ pan_nir_lower_mediump_io(nir_shader *nir)
 
    switch (nir->info.stage) {
    case MESA_SHADER_VERTEX:
-      /* Vertex shaders feeding geometry or tessellation shaders store their
-       * outputs to memory in a 32-bit layout.
-       */
-      if (nir->info.next_stage != MESA_SHADER_FRAGMENT)
-         return;
       modes = nir_var_shader_out;
       break;
    case MESA_SHADER_FRAGMENT:
-      /* Geometry and evaluation shader outputs stay 32-bit (see below) */
-      if (nir->info.prev_stage == MESA_SHADER_GEOMETRY ||
-          nir->info.prev_stage == MESA_SHADER_TESS_EVAL)
-         return;
       modes = nir_var_shader_in;
       break;
    default:
-      /* Geometry and tessellation shaders are lowered to other programs */
       return;
    }
 
@@ -525,6 +515,21 @@ pan_nir_lower_mediump_io(nir_shader *nir)
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             clear_flat_mediump_io_flag, nir_metadata_all, NULL);
+}
+
+/* GL: only between a linked vertex and fragment shader. Vertex shaders
+ * feeding geometry or tessellation shaders store 32-bit outputs to memory,
+ * the programs those are lowered to write 32-bit varyings, and separate
+ * shaders do not know their neighbour.
+ */
+void
+pan_nir_lower_mediump_io_linked(nir_shader *nir)
+{
+   if ((nir->info.stage == MESA_SHADER_VERTEX &&
+        nir->info.next_stage == MESA_SHADER_FRAGMENT) ||
+       (nir->info.stage == MESA_SHADER_FRAGMENT &&
+        nir->info.prev_stage == MESA_SHADER_VERTEX))
+      pan_nir_lower_mediump_io(nir);
 }
 
 void
