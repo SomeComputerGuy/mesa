@@ -799,15 +799,10 @@ panfrost_flush_all_batches(struct panfrost_context *ctx, const char *reason)
    PAN_TRACE_SCOPE(PAN_TRACE_GL_JOB, "%s reason=\"%s\"", __func__, reason);
    perf_debug(ctx, "Flushing everything due to: %s", reason);
 
-   struct panfrost_batch *batch = panfrost_get_compute_batch(ctx);
+   /* Submit existing batches only: a new one would be empty */
+   struct panfrost_batch *batch = ctx->batch[PANFROST_BATCH_COMPUTE];
    if (batch)
       panfrost_batch_submit(ctx, batch);
-
-   batch = panfrost_get_render_batch(ctx);
-   if (!batch)
-      return;
-
-   panfrost_batch_submit(ctx, batch);
 
    for (unsigned i = 0; i < PAN_MAX_RENDER_BATCHES; i++) {
       if (ctx->batches.slots[i].seqnum)
