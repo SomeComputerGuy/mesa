@@ -53,6 +53,7 @@
 #if PAN_ARCH >= 6
 #include "pan_precomp.h"
 #include "libpan.h"
+#include "poly/prim.h"
 #include "poly/tessellator.h"
 #endif
 
@@ -4738,6 +4739,94 @@ panfrost_draw_passthrough_gs(struct pipe_context *pipe,
    fs->vs_varying_layout = fs_layout;
    panfrost_update_shader_variant(ctx, MESA_SHADER_FRAGMENT);
 }
+
+/*
+ * Primitive restart for geometry shader draws: the geometry shader applies the
+ * input topology in compute programs, which do not know about restart. Unroll
+ * the draw on the CPU into one draw of the decomposed list topology, in the
+ * vertex order the geometry shader sees for the strip (as libpoly's
+ * poly_unroll_restart does on the GPU). Splitting the draw per restart instead
+ * would start gl_PrimitiveIDIn again at 0 after each restart, but restarting
+ * has no effect on the primitive ID counter.
+ */
+static void
+panfrost_draw_unrolled_restart(struct pipe_context *pipe,
+                               const struct pipe_draw_info *info,
+                               unsigned drawid_offset,
+                               const struct pipe_draw_start_count_bias *draw)
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+   struct pipe_transfer *transfer = NULL;
+   const uint8_t *in;
+
+   if (!draw->count)
+      return;
+
+   if (info->has_user_indices) {
+      in = (const uint8_t *)info->index.user + draw->start * info->index_size;
+   } else {
+      in = pipe_buffer_map_range(pipe, info->index.resource,
+                                 draw->start * info->index_size,
+                                 draw->count * info->index_size,
+                                 PIPE_MAP_READ, &transfer);
+      if (!in)
+         return;
+   }
+
+   enum mesa_prim mode = info->mode;
+   unsigned per_prim = mesa_vertices_per_prim(u_decomposed_prim(mode));
+   unsigned max = u_decomposed_prims_for_vertices(mode, draw->count) * per_prim;
+   uint32_t *out = max ? malloc(max * sizeof(uint32_t)) : NULL;
+   bool flatshade_first = ctx->rasterizer->base.flatshade_first;
+   unsigned n = 0;
+
+#define IDX(i)                                                                 \
+   (info->index_size == 1   ? ((const uint8_t *)in)[i]                         \
+    : info->index_size == 2 ? ((const uint16_t *)in)[i]                        \
+                            : ((const uint32_t *)in)[i])
+
+   for (unsigned start = 0; out && start < draw->count;) {
+      unsigned end = start;
+      while (end < draw->count && IDX(end) != info->restart_index)
+         end++;
+
+      unsigned prims = u_decomposed_prims_for_vertices(mode, end - start);
+      for (unsigned p = 0; p < prims; ++p) {
+         for (unsigned v = 0; v < per_prim; ++v) {
+            unsigned id =
+               poly_vertex_id_for_topology(mode, flatshade_first, p, v, prims);
+            out[n++] = IDX(start + id);
+         }
+      }
+
+      start = end + 1;
+   }
+#undef IDX
+
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+
+   if (n) {
+      struct pipe_draw_info new_info = *info;
+      new_info.mode = u_decomposed_prim(mode);
+      new_info.index_size = 4;
+      new_info.has_user_indices = true;
+      new_info.index.user = out;
+      new_info.primitive_restart = false;
+      new_info.restart_index = 0;
+      new_info.index_bounds_valid = false;
+
+      struct pipe_draw_start_count_bias new_draw = {
+         .start = 0,
+         .count = n,
+         .index_bias = draw->index_bias,
+      };
+
+      pipe->draw_vbo(pipe, &new_info, drawid_offset, NULL, &new_draw, 1);
+   }
+
+   free(out);
+}
 #endif
 
 static void
@@ -4786,8 +4875,13 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       }
 
       for (unsigned i = 0; i < num_draws; ++i) {
-         util_draw_vbo_without_prim_restart(pipe, info, drawid_offset, NULL,
-                                            &draws[i]);
+         if (info->mode == MESA_PRIM_PATCHES) {
+            util_draw_vbo_without_prim_restart(pipe, info, drawid_offset, NULL,
+                                               &draws[i]);
+         } else {
+            panfrost_draw_unrolled_restart(pipe, info, drawid_offset,
+                                           &draws[i]);
+         }
       }
       return;
    }
