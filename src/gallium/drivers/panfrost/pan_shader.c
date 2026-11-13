@@ -788,7 +788,17 @@ struct panfrost_lowered_progs {
    uint8_t nir_blake3[32];
    struct panfrost_gs_progs *gs;
    struct panfrost_tess_progs *tess;
+
+   /* CSOs using these programs; unused ones stay in ctx->lowered_unused */
+   unsigned refs;
+   struct list_head unused_link;
+
+   /* NULL once the context is destroyed */
+   struct panfrost_context *ctx;
 };
+
+/* Unused lowered programs kept for relinked programs */
+#define PANFROST_MAX_UNUSED_LOWERED_PROGS 16
 
 static uint32_t
 panfrost_blake3_key_hash(const void *key)
@@ -802,6 +812,29 @@ panfrost_blake3_key_equal(const void *a, const void *b)
    return !memcmp(a, b, 32);
 }
 
+static void
+panfrost_free_lowered_progs(struct panfrost_lowered_progs *l)
+{
+   if (l->gs) {
+      panfrost_delete_shader_state(NULL, l->gs->main);
+      panfrost_delete_shader_state(NULL, l->gs->rast);
+      if (l->gs->count)
+         panfrost_delete_shader_state(NULL, l->gs->count);
+      panfrost_delete_shader_state(NULL, l->gs->pre_gs);
+   }
+
+   if (l->tess) {
+      if (l->tess->tcs)
+         panfrost_delete_shader_state(NULL, l->tess->tcs);
+      if (l->tess->tes)
+         panfrost_delete_shader_state(NULL, l->tess->tes);
+      if (l->tess->tes_cs)
+         panfrost_delete_shader_state(NULL, l->tess->tes_cs);
+   }
+
+   ralloc_free(l);
+}
+
 /* Programs relinked per draw recreate the same CSOs: lower them once */
 static struct panfrost_lowered_progs *
 panfrost_get_lowered_progs(struct panfrost_context *ctx,
@@ -810,19 +843,54 @@ panfrost_get_lowered_progs(struct panfrost_context *ctx,
    if (!ctx->lowered_progs) {
       ctx->lowered_progs = _mesa_hash_table_create(
          NULL, panfrost_blake3_key_hash, panfrost_blake3_key_equal);
+      list_inithead(&ctx->lowered_unused);
    }
 
    struct hash_entry *he =
       _mesa_hash_table_search(ctx->lowered_progs, so->nir_blake3);
-   *found = he != NULL;
-   if (he)
-      return he->data;
+   struct panfrost_lowered_progs *l;
 
-   struct panfrost_lowered_progs *l =
-      rzalloc(ctx->lowered_progs, struct panfrost_lowered_progs);
-   memcpy(l->nir_blake3, so->nir_blake3, sizeof(l->nir_blake3));
-   _mesa_hash_table_insert(ctx->lowered_progs, l->nir_blake3, l);
+   *found = he != NULL;
+   if (he) {
+      l = he->data;
+      if (!l->refs++) {
+         list_del(&l->unused_link);
+         ctx->lowered_unused_count--;
+      }
+   } else {
+      l = rzalloc(NULL, struct panfrost_lowered_progs);
+      memcpy(l->nir_blake3, so->nir_blake3, sizeof(l->nir_blake3));
+      l->refs = 1;
+      l->ctx = ctx;
+      _mesa_hash_table_insert(ctx->lowered_progs, l->nir_blake3, l);
+   }
+
+   so->lowered = l;
    return l;
+}
+
+static void
+panfrost_unref_lowered_progs(struct panfrost_lowered_progs *l)
+{
+   if (--l->refs)
+      return;
+
+   struct panfrost_context *ctx = l->ctx;
+   if (!ctx) {
+      panfrost_free_lowered_progs(l);
+      return;
+   }
+
+   list_addtail(&l->unused_link, &ctx->lowered_unused);
+   if (++ctx->lowered_unused_count <= PANFROST_MAX_UNUSED_LOWERED_PROGS)
+      return;
+
+   struct panfrost_lowered_progs *old = list_first_entry(
+      &ctx->lowered_unused, struct panfrost_lowered_progs, unused_link);
+   list_del(&old->unused_link);
+   ctx->lowered_unused_count--;
+   _mesa_hash_table_remove_key(ctx->lowered_progs, old->nir_blake3);
+   panfrost_free_lowered_progs(old);
 }
 
 void
@@ -831,29 +899,19 @@ panfrost_lowered_progs_cache_destroy(struct panfrost_context *ctx)
    if (!ctx->lowered_progs)
       return;
 
+   /* Programs still used by CSOs are freed with their last CSO */
    hash_table_foreach(ctx->lowered_progs, he) {
       struct panfrost_lowered_progs *l = he->data;
 
-      if (l->gs) {
-         panfrost_delete_shader_state(&ctx->base, l->gs->main);
-         panfrost_delete_shader_state(&ctx->base, l->gs->rast);
-         if (l->gs->count)
-            panfrost_delete_shader_state(&ctx->base, l->gs->count);
-         panfrost_delete_shader_state(&ctx->base, l->gs->pre_gs);
-      }
-
-      if (l->tess) {
-         if (l->tess->tcs)
-            panfrost_delete_shader_state(&ctx->base, l->tess->tcs);
-         if (l->tess->tes)
-            panfrost_delete_shader_state(&ctx->base, l->tess->tes);
-         if (l->tess->tes_cs)
-            panfrost_delete_shader_state(&ctx->base, l->tess->tes_cs);
-      }
+      if (l->refs)
+         l->ctx = NULL;
+      else
+         panfrost_free_lowered_progs(l);
    }
 
    _mesa_hash_table_destroy(ctx->lowered_progs, NULL);
    ctx->lowered_progs = NULL;
+   ctx->lowered_unused_count = 0;
 }
 
 static void
@@ -992,6 +1050,15 @@ struct panfrost_passthrough_gs_key {
    uint32_t mode;
 };
 
+struct panfrost_passthrough_gs_entry {
+   struct panfrost_passthrough_gs_key key;
+   struct panfrost_uncompiled_shader *gs;
+   struct list_head lru_link;
+};
+
+/* Passthrough geometry shaders kept, least recently used dropped first */
+#define PANFROST_MAX_PASSTHROUGH_GS 16
+
 static uint32_t
 panfrost_passthrough_gs_key_hash(const void *key)
 {
@@ -1036,11 +1103,25 @@ panfrost_get_passthrough_gs(struct panfrost_context *ctx,
       ctx->passthrough_gs =
          _mesa_hash_table_create(NULL, panfrost_passthrough_gs_key_hash,
                                  panfrost_passthrough_gs_key_equal);
+      list_inithead(&ctx->passthrough_gs_lru);
    }
 
    struct hash_entry *he = _mesa_hash_table_search(ctx->passthrough_gs, &key);
-   if (he)
-      return he->data;
+   if (he) {
+      struct panfrost_passthrough_gs_entry *e = he->data;
+      list_move_to(&e->lru_link, &ctx->passthrough_gs_lru);
+      return e->gs;
+   }
+
+   if (ctx->passthrough_gs->entries >= PANFROST_MAX_PASSTHROUGH_GS) {
+      struct panfrost_passthrough_gs_entry *old = list_last_entry(
+         &ctx->passthrough_gs_lru, struct panfrost_passthrough_gs_entry,
+         lru_link);
+      list_del(&old->lru_link);
+      _mesa_hash_table_remove_key(ctx->passthrough_gs, &old->key);
+      panfrost_delete_shader_state(&ctx->base, old->gs);
+      ralloc_free(old);
+   }
 
    nir_shader *nir = nir_create_passthrough_gs(
       ctx->base.screen->nir_options[MESA_SHADER_GEOMETRY], prev->outputs_nir,
@@ -1051,13 +1132,13 @@ panfrost_get_passthrough_gs(struct panfrost_context *ctx,
       .ir.nir = nir,
    };
 
-   struct panfrost_uncompiled_shader *gs =
-      panfrost_create_shader_state(&ctx->base, &state);
-
-   struct panfrost_passthrough_gs_key *stored =
-      ralloc_memdup(ctx->passthrough_gs, &key, sizeof(key));
-   _mesa_hash_table_insert(ctx->passthrough_gs, stored, gs);
-   return gs;
+   struct panfrost_passthrough_gs_entry *e =
+      rzalloc(ctx->passthrough_gs, struct panfrost_passthrough_gs_entry);
+   e->key = key;
+   e->gs = panfrost_create_shader_state(&ctx->base, &state);
+   list_add(&e->lru_link, &ctx->passthrough_gs_lru);
+   _mesa_hash_table_insert(ctx->passthrough_gs, &e->key, e);
+   return e->gs;
 }
 
 void
@@ -1066,8 +1147,10 @@ panfrost_passthrough_gs_cache_destroy(struct panfrost_context *ctx)
    if (!ctx->passthrough_gs)
       return;
 
-   hash_table_foreach(ctx->passthrough_gs, he)
-      panfrost_delete_shader_state(&ctx->base, he->data);
+   hash_table_foreach(ctx->passthrough_gs, he) {
+      struct panfrost_passthrough_gs_entry *e = he->data;
+      panfrost_delete_shader_state(&ctx->base, e->gs);
+   }
 
    _mesa_hash_table_destroy(ctx->passthrough_gs, NULL);
    ctx->passthrough_gs = NULL;
@@ -1270,7 +1353,8 @@ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
       free(cso->xfb);
    }
 
-   /* cso->gs and cso->tess belong to ctx->lowered_progs */
+   if (cso->lowered)
+      panfrost_unref_lowered_progs(cso->lowered);
 
    simple_mtx_destroy(&cso->lock);
 

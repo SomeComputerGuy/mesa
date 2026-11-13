@@ -158,11 +158,14 @@ struct panfrost_context {
     * shared by the vertex and tessellation evaluation shaders they fit.
     */
    struct hash_table *passthrough_gs;
+   struct list_head passthrough_gs_lru;
 
    /* Lowered geometry and tessellation programs by NIR hash, shared by the
     * CSOs of identical shaders.
     */
    struct hash_table *lowered_progs;
+   struct list_head lowered_unused;
+   unsigned lowered_unused_count;
 
    /* Current batches */
    struct panfrost_batch *batch[PANFROST_BATCH_TYPE_COUNT];
@@ -613,6 +616,9 @@ struct panfrost_uncompiled_shader {
 
    /* Tessellation control/evaluation shaders: the lowered program */
    struct panfrost_tess_progs *tess;
+
+   /* Owner of gs/tess, shared by CSOs of identical shaders */
+   struct panfrost_lowered_progs *lowered;
 
    /* Vertex and tessellation evaluation shaders: mask of outputs written,
     * for the memory layout of outputs_to_memory variants.
