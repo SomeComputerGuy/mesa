@@ -492,6 +492,10 @@ pan_nir_lower_mediump_io(nir_shader *nir)
       modes = nir_var_shader_out;
       break;
    case MESA_SHADER_FRAGMENT:
+      /* Geometry and evaluation shader outputs stay 32-bit (see below) */
+      if (nir->info.prev_stage == MESA_SHADER_GEOMETRY ||
+          nir->info.prev_stage == MESA_SHADER_TESS_EVAL)
+         return;
       modes = nir_var_shader_in;
       break;
    default:
