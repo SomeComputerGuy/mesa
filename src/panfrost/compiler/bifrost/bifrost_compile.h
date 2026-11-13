@@ -150,7 +150,12 @@ bool valhall_can_merge_workgroups(nir_shader *nir);
          (nir_var_shader_in | nir_var_shader_out | nir_var_function_temp),     \
       .force_indirect_unrolling_sampler = true,                                \
       .scalarize_ddx = true,                                                   \
-      .support_indirect_inputs = 0 /* TODO support indirect varyings */,       \
+      /* Tessellation shader I/O is lowered to memory (libpoly), which takes \
+       * any vertex index and slot: no if-else trees of direct accesses.     \
+       */                                                                     \
+      .support_indirect_inputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL) |         \
+                                 BITFIELD_BIT(MESA_SHADER_TESS_EVAL),          \
+      .support_indirect_outputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL),         \
       .lower_hadd = arch >= 11,                                                \
       .lower_hadd64 = true,                                                    \
       .lower_mul_32x16 = true,                                                 \
